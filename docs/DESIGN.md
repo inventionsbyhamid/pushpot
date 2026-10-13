@@ -1,0 +1,352 @@
+# PushPot design
+
+PushPot is a group pushup challenge with real stakes. Friends put USDC into a pot, commit to a
+daily pushup target, and prove each set with the phone camera. Anyone who misses a day forfeits
+their stake to the people who finish.
+
+Pushups are counted on-device by a pose model running in the browser. Stakes live in a contract
+on Arc, where USDC is the gas token and blocks finalize in under a second. That makes small,
+social stakes practical: a check-in costs a fraction of a cent and confirms before the
+celebration animation finishes.
+
+## Goals
+
+- Anyone can open the site on a phone and count pushups with the camera within seconds,
+  without a wallet (practice mode).
+- A group can create a pot, invite friends with a link, stake USDC, and check in daily, with
+  each check-in recorded on Arc in about a second.
+- Payouts are enforced by the contract. The server can attest workouts but can never move
+  funds.
+
+Out of scope for now: native apps, other exercises, fiat on-ramp, multi-chain.
+
+## How it works
+
+1. **Create.** The creator picks the reps per period (e.g. 20), the number of periods (e.g. 7),
+   the period length (daily, or a short sprint), the stake, the start time and the member cap,
+   then stakes in the same transaction.
+2. **Invite.** The creator shares `/p/:id`. Friends join by staking the same amount before the
+   start time.
+3. **Check in.** Each period, members open the pot and do their reps in front of the camera.
+   The browser counts reps and records a compact telemetry trace. The server validates the
+   trace and submits `checkIn` to the contract from the oracle key.
+4. **Settle.** After the last period (plus a short grace window), members who checked in every
+   period split the whole pot. If nobody finished, everyone gets their stake back.
+
+## Architecture
+
+```
+ Phone browser (React SPA)                     Server (Rust, axum)
+ ┌────────────────────────────┐   HTTPS   ┌───────────────────────────────┐
+ │ MediaPipe pose (on-device) │──────────▶│ SIWE auth, sessions           │
+ │ rep counter + telemetry    │ JSON, SSE │ pots / workouts API           │
+ │ wagmi + viem wallet        │◀──────────│ telemetry validator           │
+ └──────────────┬─────────────┘           │ oracle tx sender (one actor)  │
+                │ create / join / claim   │ log indexer                   │
+                ▼ (signed by the user)    │ static SPA + model files      │
+ ┌────────────────────────────┐           └──────┬───────────────┬────────┘
+ │ Arc: PushPot.sol (escrow)  │◀── checkIn ──────┘               │ sqlx
+ └────────────────────────────┘    (oracle key)          ┌───────▼───────┐
+                                                         │ Postgres      │
+                                                         └───────────────┘
+```
+
+The server binary also serves the built SPA, so everything is same-origin. The camera
+requires HTTPS, which the reverse proxy in front of the container provides.
+
+## Trust model
+
+- **Funds.** Only the contract holds stakes, and funds can only flow back to members. The
+  owner can rotate the oracle and nothing else.
+- **Check-ins.** The oracle is trusted to attest that a workout happened. The contract limits
+  what it can do: it only accepts a check-in for the current period (plus a 5 minute grace),
+  for a member, with at least the target reps. The oracle can't backfill or rewrite history.
+- **Liveness.** If the oracle goes offline for the whole challenge, nobody completes and
+  everyone is refunded.
+- **Evidence.** Each check-in emits `evidenceHash = keccak256(telemetry)`, and the telemetry is
+  public at `/api/evidence/:hash`.
+- **Limits.** Client-side detection can be spoofed by someone determined. The server raises the
+  bar: it recounts reps from the raw angle trace and runs plausibility checks on timing,
+  range of motion and signal statistics. Stronger proofs (peer-reviewed clips, attested
+  devices) are future work.
+- **Caps.** The contract is small and tested but unaudited. Stake is capped at 50 USDC per
+  member, and a pot holds at most 50 members.
+
+## Contract
+
+`contracts/src/PushPot.sol`, Solidity 0.8.30, Foundry, OpenZeppelin 5.7.
+
+**USDC.** Stakes use the USDC ERC-20 interface at `0x3600…0000` (6 decimals), as Arc's docs
+recommend for apps that hold USDC. On Arc, native USDC (18 decimals) and the ERC-20 view are
+the same balance. So the contract never touches `msg.value`, has no `receive()`, and has no
+native-balance sweep (a sweep would also drain escrowed deposits).
+
+**Joining.** Joins and pot creation accept an EIP-2612 permit, so each takes one transaction.
+Arc's USDC permit domain is name `USDC`, version `2`.
+
+| Function | Who | Rules |
+|---|---|---|
+| `createPot(params)` / `createPotWithPermit` | anyone | validates params; the creator joins and stakes |
+| `join` / `joinWithPermit` | anyone | before `startTime`, not full, exact stake |
+| `leave` | member | before `startTime`; refunds the stake |
+| `checkIn(potId, member, period, reps, evidenceHash)` | oracle | member; `reps ≥ target`; inside the period window + `GRACE`; once per period |
+| `claim` | member | after `endTime + GRACE`; completers split the pot (the last claimer takes the rounding remainder); if there are no completers, everyone is refunded |
+| `setOracle` | owner | — |
+
+**Limits.**
+
+| Constant | Value |
+|---|---|
+| Period length | 10 minutes – 7 days |
+| Periods | ≤ 90 |
+| Members | 2 – 50 |
+| Reps per period | ≤ 1000 |
+| Start time | ≤ 30 days ahead |
+| Title | ≤ 48 bytes |
+
+**Events.** `PotCreated`, `Joined`, `Left`, `CheckedIn`, `Claimed` and `OracleUpdated` carry
+everything the indexer needs.
+
+## Server
+
+`server/`, Rust 1.99, axum 0.8, sqlx 0.9 (Postgres), alloy 2.5.
+
+**Auth.** Sign-In with Ethereum (EIP-4361):
+
+1. `GET /api/auth/nonce` issues a single-use nonce (valid 10 minutes).
+2. The client signs a SIWE message built with viem.
+3. `POST /api/auth/verify` checks domain, chain ID, nonce and expiry, and recovers the EIP-191
+   signer. For smart-contract wallets it falls back to ERC-1271 `isValidSignature`.
+4. The session is an HttpOnly cookie holding a random token. Only its SHA-256 is stored, with a
+   7 day expiry.
+
+**Indexer.** The indexer is the single writer for on-chain state.
+
+- It polls `eth_getLogs` for the contract about once per second, in ranges of at most 9,999
+  blocks (the RPC caps a query at 10k).
+- Each batch is applied in one database transaction together with the `last_block` cursor, so
+  every log is applied exactly once.
+- Arc's finality is deterministic, so there is no reorg handling.
+- After a commit, the indexer publishes events to SSE subscribers.
+
+**Oracle.**
+
+- One task owns the oracle key, so nonces never race.
+- Requests arrive over a channel. The task sends `checkIn` with `maxFeePerGas` ≥ 20 gwei
+  (Arc's floor: anything lower is silently dropped), then polls for the receipt.
+- A check-in costs roughly $0.002 and confirms in about a second.
+
+**Workouts.**
+
+1. `POST /api/workouts {pot_id}` checks the caller is an active member, that a period is
+   running, and that they haven't checked in yet. It records `started_at` on the server.
+2. `POST /api/workouts/:id/complete {telemetry}` validates the telemetry, stores it, submits
+   `checkIn`, and returns the transaction hash and latency. A rejection returns a readable
+   reason.
+
+### API
+
+All JSON uses snake_case. Amounts are in USDC base units (6 decimals) as integers.
+
+| Method & path | Response |
+|---|---|
+| `GET /api/auth/nonce` | `{nonce}` |
+| `POST /api/auth/verify {message, signature}` | `{address}` + session cookie |
+| `POST /api/auth/logout` | `204` |
+| `GET /api/me` | `{address}` or `401` |
+| `GET /api/pots?scope=open\|mine` | `{pots: Pot[]}` |
+| `GET /api/pots/:id` | `{pot: Pot, members: Member[]}` |
+| `GET /api/pots/:id/events` | SSE: `joined`, `left`, `checked_in`, `claimed` |
+| `POST /api/workouts {pot_id}` | `{workout_id, period, reps_target, period_ends_at}` |
+| `POST /api/workouts/:id/complete {telemetry}` | `{status: "recorded", tx_hash, latency_ms}` or `422 {error}` |
+| `GET /api/evidence/:hash` | the stored telemetry |
+| `GET /healthz` | `ok` |
+
+```
+Pot    = {id, title, creator, stake, reps_per_period, periods, period_seconds,
+          start_time, end_time, max_members, member_count,
+          status: "upcoming" | "active" | "ended", current_period: number | null}
+Member = {address, checked_in: number[], completed, out, claimed_amount: number | null}
+```
+
+`start_time` and `end_time` are RFC 3339. A member is `out` once they've missed any finished
+period.
+
+### Telemetry (v1)
+
+The client sends one object per workout:
+
+```json
+{
+  "v": 1,
+  "workout_id": "uuid",
+  "model": "pose_landmarker_lite",
+  "delegate": "GPU",
+  "video": { "w": 640, "h": 480 },
+  "duration_ms": 41250,
+  "reps": [
+    { "start": 1200, "bottom": 1650, "end": 2150,
+      "min_elbow": 84, "max_elbow": 163, "min_body": 158, "vis": 0.91 }
+  ],
+  "trace": { "dt": "<base64 u8[]>", "elbow": "<base64 u8[]>",
+             "body": "<base64 u8[]>", "vis": "<base64 u8[]>" }
+}
+```
+
+Field notes:
+
+- Rep times are milliseconds since counting started. Angles are in degrees.
+- `trace` holds one sample per processed frame:
+  - `dt`: milliseconds since the previous frame, capped at 255;
+  - `elbow`: smoothed elbow angle, 0–180;
+  - `body`: shoulder–hip–ankle angle, 0–180;
+  - `vis`: mean visibility × 255.
+
+The server rejects a workout when any of these fail:
+
+- **Session.** There are at least `reps_target` reps, and `duration_ms` ≤ server-observed
+  elapsed time + 5 s.
+- **Per rep.**
+  - no overlap with the previous rep, and rep ends at least 400 ms apart;
+  - duration 400–8000 ms;
+  - min elbow ≤ 105°, max ≥ 145°, swing ≥ 45°;
+  - min body line ≥ 140°;
+  - visibility ≥ 0.4.
+- **Trace.**
+  - channels have equal lengths, with at least 5 frames per rep;
+  - `Σdt` within 10% of `duration_ms`;
+  - median frame rate ≥ 10 fps;
+  - mean visibility ≥ 0.5.
+- **Recount.** The server recounts reps from `trace.elbow` with an independent hysteresis
+  counter (down ≤ 105°, up ≥ 145°, cycle ≥ 400 ms), and the result must reach `reps_target`.
+- **Synthetic signals.** With 15+ reps, rep durations must not be near-identical (coefficient
+  of variation < 3%). With 5+ reps, the minimum elbow angles must not be (standard deviation
+  < 1°).
+
+## Web app
+
+`web/`: React 19, Vite, TypeScript, Tailwind 4, react-router, TanStack Query.
+
+**Config.** The chain ID and contract address are compiled into the bundle (`VITE_CHAIN_ID`,
+`VITE_PUSHPOT_ADDRESS`) rather than fetched from the API, so a tampered API response can't
+redirect what users sign.
+
+**Wallet.** RainbowKit 2 with wagmi 2 and viem 2.56 (which includes the `arc` chain).
+
+- MetaMask is featured; WalletConnect is also offered.
+- On mobile browsers without an injected wallet, an "Open in MetaMask" deep link is offered.
+- In-app browsers (Instagram, WhatsApp and similar) get a prompt to open the system browser.
+- A "Get USDC on Arc" link points to the Arc Portal.
+
+**Pose.** `@mediapipe/tasks-vision` 0.10.35 (pinned: later releases add network telemetry)
+with the `pose_landmarker_lite` model.
+
+- Runs in VIDEO mode, on the GPU delegate with a CPU fallback.
+- The WASM and model are self-hosted.
+- Frames are driven by `requestVideoFrameCallback` on 640×480 front-camera video.
+- The skeleton overlay is drawn on a separate 2D canvas.
+
+**Setup check.** Before counting starts, the app checks:
+
+- the near-side shoulder, elbow, wrist, hip and ankle have visibility ≥ 0.6 and are inside the
+  frame;
+- the body is side-on: shoulder spread ÷ torso length < 0.8;
+- the user is in a plank with arms extended for 0.5 s.
+
+**Rep counter.** A pure, unit-tested module:
+
+- *Side selection:* uses the more visible side, with hysteresis.
+- *Smoothing:* a median-of-3 filter, then a One Euro filter (min cutoff 1.0 Hz, β 0.02).
+- *Frame gating:* a frame counts only if shoulder, hip, elbow and wrist visibility are ≥ 0.5.
+- *Down:* elbow ≤ 100° for two frames.
+- *Up:* elbow ≥ 150° for two frames.
+- *A rep counts only if:*
+  - the cycle is ≥ 500 ms;
+  - ≥ 500 ms have passed since the last rep;
+  - ≥ 5 valid frames, at ≥ 70% valid;
+  - min body line ≥ 145°;
+  - wrist drift ≤ 0.25 × torso length.
+- *Feedback:* partial reps produce "go lower", "lock out", "hips sagging" and "move into frame".
+
+**Feel.**
+
+- A huge rep counter.
+- A beep and a haptic pulse per rep (`navigator.vibrate`).
+- Confetti on the final rep.
+- Wake Lock while the camera is on.
+- After a check-in: "Recorded on Arc in 0.9 s" with an explorer link.
+
+## Security
+
+Money is involved, so the defaults are conservative.
+
+**Contract**
+
+- Funds only ever move back to members. The owner can pause new pots and joins, but check-ins,
+  leaving and claims are never paused, so a pause can't lock anyone's stake.
+- Strict checks-effects-interactions everywhere: state and events first, then the permit, then
+  the transfer. All entry points that move tokens are `nonReentrant` (transient-storage guard).
+- `SafeERC20` for transfers; `Ownable2Step` for ownership; no native-value paths.
+- Tested with:
+  - unit tests;
+  - a fuzzed conservation test;
+  - stateful invariants (balance equals deposits minus withdrawals and covers every pot);
+  - Slither. Only the expected timestamp notes remain.
+
+**Server**
+
+- *SIWE.* Checks domain, URI origin, chain, single-use nonce and expiry.
+- *Sessions.* A random 256-bit token in an `HttpOnly`, `Secure`, `SameSite=Lax` cookie with the
+  `__Host-` prefix. Only its SHA-256 is stored.
+- *CSRF.* Every non-GET `/api` request must carry our exact `Origin`. Bodies must be JSON.
+- *Limits.* Bodies are capped at 64 KB (512 KB for telemetry), and auth endpoints are
+  rate-limited per IP.
+- *Response headers:*
+  - a CSP that allows `'self'` plus the Arc RPC and WalletConnect;
+  - `frame-ancestors 'none'`;
+  - HSTS;
+  - `nosniff`;
+  - a Permissions-Policy that allows only the camera.
+- *SQL.* Bound parameters only; sqlx rejects dynamically built SQL at compile time.
+- *Oracle key.* It can only check members in. It holds a few dollars of gas, and the owner can
+  rotate it.
+
+**Web**
+
+- Permits are signed for the exact stake, read from the contract, never from the API.
+- Network and balance are checked before every signature.
+- The MediaPipe runtime is self-hosted, and the model is pinned by SHA-256.
+
+## Deployment
+
+- **Image.** A multi-stage Dockerfile: Node builds `web/dist`, Rust builds the server, and the
+  runtime is a slim Debian image with the binary and static files.
+- **Hosting.** Coolify runs the image next to a managed Postgres, with HTTPS on a custom domain.
+  Migrations run at startup.
+- **Contract.** Deployed with Foundry: first Arc testnet (chain 5042002), then Arc mainnet
+  (chain 5042, `https://rpc.mainnet.arc.io`). Verified through Sourcify.
+
+Configuration is through environment variables:
+
+| Variable | Notes |
+|---|---|
+| `DATABASE_URL` | |
+| `PUBLIC_ORIGIN` | |
+| `ARC_RPC_URL` | |
+| `ARC_CHAIN_ID` | |
+| `PUSHPOT_ADDRESS` | |
+| `PUSHPOT_DEPLOY_BLOCK` | |
+| `ORACLE_PRIVATE_KEY` | |
+| `EXPLORER_URL` | |
+| `BIND_ADDR` | optional |
+| `WEB_DIR` | optional |
+
+## Testing
+
+- **Contract.** Foundry unit tests for every rule, plus a fuzz test that payouts always sum to
+  the total staked.
+- **Server.** Unit tests for the telemetry validator and SIWE parsing; integration tests
+  against Postgres.
+- **Web.** Vitest for the One Euro filter, angle maths and the rep state machine on synthetic
+  traces; manual runs on Android Chrome and iOS Safari.
+- **End to end.** A pot with three 10 minute periods across two wallets on mainnet.
