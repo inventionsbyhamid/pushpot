@@ -156,7 +156,7 @@ impl Oracle {
             .with_simple_nonce_management()
             .with_chain_id(config.chain_id)
             .wallet(config.oracle_signer.clone())
-            .connect_http(config.rpc_url.clone())
+            .connect_client(super::rpc_client(&config.rpc_url))
             .erased();
         let (jobs, rx) = mpsc::channel(64);
         let worker = Worker::new(provider, config.contract, config.rpc_url.clone());

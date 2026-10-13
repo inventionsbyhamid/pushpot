@@ -10,9 +10,13 @@ use alloy::{
     contract::Error as ContractError,
     primitives::{Address, B256, Bytes, U256, eip191_hash_message},
     providers::{DynProvider, Provider, ProviderBuilder},
-    rpc::types::{Filter, Log, TransactionRequest},
+    rpc::{
+        client::{ClientBuilder, RpcClient},
+        types::{Filter, Log, TransactionRequest},
+    },
     sol,
     sol_types::SolCall,
+    transports::layers::RetryBackoffLayer,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use url::{Position, Url};
@@ -108,6 +112,22 @@ const ERC1271_MAGIC: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 /// Blocks per `eth_getLogs` query. Most providers allow this many; free plans allow far fewer,
 /// which `Chain::logs` learns from their errors.
 pub const MAX_LOG_RANGE: u64 = 9_999;
+/// Free plans throttle bursts with HTTP 429. Calls back off and retry instead of failing; the
+/// budget matches Alchemy's free tier.
+const RATE_LIMIT_RETRIES: u32 = 10;
+const RATE_LIMIT_BACKOFF_MS: u64 = 500;
+const COMPUTE_UNITS_PER_SECOND: u64 = 330;
+
+/// An HTTP client for the RPC that rides out rate limits.
+pub fn rpc_client(url: &Url) -> RpcClient {
+    ClientBuilder::default()
+        .layer(RetryBackoffLayer::new(
+            RATE_LIMIT_RETRIES,
+            RATE_LIMIT_BACKOFF_MS,
+            COMPUTE_UNITS_PER_SECOND,
+        ))
+        .http(url.clone())
+}
 
 #[derive(Clone)]
 pub struct Chain {
@@ -122,7 +142,7 @@ pub struct Chain {
 impl Chain {
     pub async fn connect(config: &Config) -> Result<Self> {
         let provider = ProviderBuilder::new()
-            .connect_http(config.rpc_url.clone())
+            .connect_client(rpc_client(&config.rpc_url))
             .erased();
         let chain_id = provider.get_chain_id().await.map_err(|err| {
             anyhow!(
