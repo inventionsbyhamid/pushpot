@@ -165,8 +165,8 @@ impl Chain {
     }
 
     /// Reads logs matching `filter` from `from` towards `to` and returns them with the last block
-    /// they cover. A provider that refuses the range as too wide is asked for ever narrower ones,
-    /// and the width that worked is kept for later queries.
+    /// they cover. A provider that refuses the range as too wide is asked for half as many blocks
+    /// until it accepts, and the width that worked is kept for later queries.
     pub async fn logs(&self, filter: &Filter, from: u64, to: u64) -> Result<(Vec<Log>, u64)> {
         let mut to = to.min(from + self.log_range.load(Ordering::Relaxed) - 1);
         loop {
@@ -174,7 +174,8 @@ impl Chain {
             match self.provider.get_logs(&query).await {
                 Ok(logs) => return Ok((logs, to)),
                 Err(err) if to > from && err.to_string().to_ascii_lowercase().contains("range") => {
-                    let narrower = ((to - from + 1) / 10).max(1);
+                    // Halving ends within a factor of two of the limit wherever it starts.
+                    let narrower = (to - from).div_ceil(2);
                     self.log_range.store(narrower, Ordering::Relaxed);
                     tracing::warn!(
                         blocks = narrower,

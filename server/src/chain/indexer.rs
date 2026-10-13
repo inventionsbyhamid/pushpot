@@ -706,16 +706,16 @@ mod tests {
         let refusal = "Under the Free tier plan, you can make eth_getLogs requests with up to a \
                        10 block range.";
 
-        // Head 31: the first query asks for blocks 6 to 30, then 6 to 7 after the refusal.
+        // Head 31: blocks 6 to 30 are refused, then read as 6 to 17, 18 to 29 and 30.
         rpc.push_success(&"0x1f");
         rpc.push_failure_msg(refusal);
-        for _ in 0..13 {
+        for _ in 0..3 {
             rpc.push_success(&Vec::<Log>::new());
         }
         let mut cursor = 5;
         read(&state, &mut cursor).await.unwrap();
         assert_eq!(cursor, 30);
-        assert_eq!(state.chain.log_range.load(Ordering::Relaxed), 2);
+        assert_eq!(state.chain.log_range.load(Ordering::Relaxed), 12);
         assert!(rpc.read_q().is_empty());
     }
 

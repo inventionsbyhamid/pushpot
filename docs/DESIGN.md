@@ -134,7 +134,8 @@ everything the indexer needs.
   head seen 5 minutes earlier: by then every log up to it has been delivered. That costs one
   `eth_blockNumber`, about 300 calls a day idle, and keeps a restart's catch up short.
 - Reads cover at most 9,999 blocks. Free plans allow fewer (Alchemy's: 10), so a refused range
-  is retried ten times narrower until it is accepted, and that width is kept. Reads stay one
+  is halved until it is accepted, and that width is kept. Rate limits (HTTP 429) back off and
+  retry within the provider's compute unit budget. Reads stay one
   block behind the head: behind a load balancer, the node answering `eth_getLogs` may not have
   the block another node reported as the head yet.
 - Applying a log twice is harmless: every write is an upsert or a no op when repeated, and
