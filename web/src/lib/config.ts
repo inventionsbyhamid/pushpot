@@ -19,6 +19,9 @@ export const usdcDecimals = 6;
 export const explorerUrl = chain.blockExplorers.default.url;
 export const walletConnectProjectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID ?? "";
 export const getUsdcUrl = "https://portal.arc.io/deposit";
+export const repoUrl = "https://github.com/inventionsbyhamid/pushpot";
+/** The contract's verified source and compiler settings. */
+export const sourceUrl = `https://repo.sourcify.dev/${chain.id}/${pushPotAddress}`;
 
 export const txUrl = (hash: string) => `${explorerUrl}/tx/${hash}`;
 export const addressUrl = (address: string) => `${explorerUrl}/address/${address}`;

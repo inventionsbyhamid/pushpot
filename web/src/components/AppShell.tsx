@@ -1,7 +1,8 @@
 import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { Suspense } from "react";
 import { Link, Outlet } from "react-router";
-import { addressUrl, chain, getUsdcUrl, pushPotAddress } from "../lib/config";
+import { addressUrl, chain, getUsdcUrl, pushPotAddress, repoUrl, sourceUrl } from "../lib/config";
+import { shortAddress } from "../lib/format";
 import { ExternalLink } from "./ExternalLink";
 import { OpenInMetaMask } from "./OpenInMetaMask";
 import { PageSpinner } from "./PageSpinner";
@@ -39,18 +40,38 @@ export function AppShell() {
         </Suspense>
       </main>
 
-      <footer className="mx-auto flex w-full max-w-md flex-wrap items-center gap-x-6 px-4 pt-8 pb-6 text-sm text-mute">
-        <ExternalLink href={getUsdcUrl} className="inline-flex min-h-11 items-center text-chalk">
-          Get USDC on Arc
-        </ExternalLink>
-        <ExternalLink
-          href={addressUrl(pushPotAddress)}
-          className="inline-flex min-h-11 items-center"
-        >
-          Contract
-        </ExternalLink>
-        <span>Running on {chain.name}</span>
-        <span>iPhone and Android apps coming soon</span>
+      <footer className="mx-auto w-full max-w-md px-4 pt-8 pb-6 text-sm text-mute">
+        <dl className="grid grid-cols-[auto_1fr] items-center gap-x-4 rounded-2xl border border-line bg-panel px-4 py-1">
+          <dt>Contract</dt>
+          <dd>
+            <ExternalLink
+              href={addressUrl(pushPotAddress)}
+              title={pushPotAddress}
+              className="inline-flex min-h-11 items-center font-mono text-chalk"
+            >
+              {shortAddress(pushPotAddress)}
+            </ExternalLink>{" "}
+            on {chain.name}
+          </dd>
+          <dt>Source</dt>
+          <dd>
+            <ExternalLink href={sourceUrl} className="inline-flex min-h-11 items-center text-chalk">
+              Verified on Sourcify
+            </ExternalLink>
+          </dd>
+          <dt>Code</dt>
+          <dd>
+            <ExternalLink href={repoUrl} className="inline-flex min-h-11 items-center text-chalk">
+              Open source on GitHub
+            </ExternalLink>
+          </dd>
+        </dl>
+        <div className="mt-2 flex flex-wrap items-center gap-x-6">
+          <ExternalLink href={getUsdcUrl} className="inline-flex min-h-11 items-center text-chalk">
+            Get USDC on Arc
+          </ExternalLink>
+          <span>iPhone and Android apps coming soon</span>
+        </div>
       </footer>
     </div>
   );
