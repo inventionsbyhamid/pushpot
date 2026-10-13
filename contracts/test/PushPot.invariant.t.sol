@@ -99,6 +99,34 @@ contract PushPotHandler is Test {
         }
     }
 
+    function createChallenge(uint128 stake, uint16 periods) external useCurrentTime {
+        PushPot.PotParams memory p = PushPot.PotParams({
+            title: "official",
+            stake: uint128(bound(stake, pot.MIN_STAKE(), pot.maxStake())),
+            repsPerPeriod: 20,
+            periods: uint16(bound(periods, 1, 3)),
+            periodSeconds: pot.MIN_PERIOD(),
+            startTime: uint64(block.timestamp + 30 minutes),
+            maxMembers: uint16(actors.length)
+        });
+        vm.prank(pot.curator());
+        try pot.createChallenge(p) returns (uint256 id) {
+            potIds.push(id);
+            oracleAtCreation[id] = pot.oracle();
+        } catch {}
+    }
+
+    function collectFee(uint256 potSeed) external useCurrentTime {
+        if (potIds.length == 0) return;
+        try pot.collectFee(_pot(potSeed)) returns (uint256 fee) {
+            withdrawn += fee;
+        } catch {}
+    }
+
+    function setFee(uint16 feeBps) external {
+        pot.setFee(uint16(bound(feeBps, 0, pot.MAX_FEE_BPS())));
+    }
+
     function rotateOracle(uint256 seed) external {
         address candidate = oracles[seed % oracles.length];
         if (seed % 5 == 0) {
@@ -143,7 +171,17 @@ contract PushPotInvariantTest is Test {
     function setUp() public {
         vm.warp(1_800_000_000);
         usdc = new MockUSDC();
-        pot = new PushPot(address(usdc), makeAddr("oracle"), 50e6, address(this));
+        pot = new PushPot(
+            PushPot.Config({
+                usdc: address(usdc),
+                oracle: makeAddr("oracle"),
+                curator: makeAddr("curator"),
+                treasury: makeAddr("treasury"),
+                owner: address(this),
+                maxStake: 50e6,
+                feeBps: 500
+            })
+        );
         handler = new PushPotHandler(pot, usdc);
         pot.transferOwnership(address(handler));
         vm.prank(address(handler));
@@ -160,9 +198,10 @@ contract PushPotInvariantTest is Test {
         for (uint256 i; i < handler.potCount(); i++) {
             PushPot.Pot memory p = pot.getPot(handler.potIds(i));
             uint256 total = uint256(p.stake) * p.memberCount;
-            assertLe(p.paidOut, total);
+            uint256 fee = p.feeCollected ? _expectedFee(p) : 0;
+            assertLe(p.paidOut + fee, total);
             assertLe(p.completerCount, p.memberCount);
-            owed += total - p.paidOut;
+            owed += total - p.paidOut - fee;
         }
         assertEq(usdc.balanceOf(address(pot)), owed);
     }
@@ -172,5 +211,11 @@ contract PushPotInvariantTest is Test {
             uint256 id = handler.potIds(i);
             assertEq(pot.getPot(id).oracle, handler.oracleAtCreation(id));
         }
+    }
+
+    /// Fee as specified: a share of the forfeited stakes, and nothing if nobody completed.
+    function _expectedFee(PushPot.Pot memory p) internal pure returns (uint256) {
+        if (p.completerCount == 0) return 0;
+        return uint256(p.stake) * (p.memberCount - p.completerCount) * p.feeBps / 10_000;
     }
 }

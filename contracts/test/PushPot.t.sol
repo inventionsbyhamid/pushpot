@@ -12,6 +12,8 @@ contract PushPotTest is Test {
 
     address internal owner = makeAddr("owner");
     address internal oracle = makeAddr("oracle");
+    address internal treasury = makeAddr("treasury");
+    address internal curator = makeAddr("curator");
     address internal alice;
     uint256 internal aliceKey;
     address internal bob = makeAddr("bob");
@@ -21,12 +23,13 @@ contract PushPotTest is Test {
     uint128 internal constant MAX_STAKE = 50e6;
     uint32 internal constant DAY = 1 days;
     uint32 internal constant GRACE = 5 minutes;
+    uint16 internal constant FEE_BPS = 500;
 
     function setUp() public {
         vm.warp(1_800_000_000);
         (alice, aliceKey) = makeAddrAndKey("alice");
         usdc = new MockUSDC();
-        pot = new PushPot(address(usdc), oracle, MAX_STAKE, owner);
+        pot = new PushPot(_config());
 
         address[3] memory users = [alice, bob, carol];
         for (uint256 i; i < users.length; i++) {
@@ -34,6 +37,18 @@ contract PushPotTest is Test {
             vm.prank(users[i]);
             usdc.approve(address(pot), type(uint256).max);
         }
+    }
+
+    function _config() internal view returns (PushPot.Config memory) {
+        return PushPot.Config({
+            usdc: address(usdc),
+            oracle: oracle,
+            curator: curator,
+            treasury: treasury,
+            owner: owner,
+            maxStake: MAX_STAKE,
+            feeBps: FEE_BPS
+        });
     }
 
     function _params() internal view returns (PushPot.PotParams memory) {
@@ -423,18 +438,23 @@ contract PushPotTest is Test {
         }
         _warpPastEnd(id);
 
-        assertEq(pot.claimable(id, alice), 15e6);
+        assertEq(pot.claimable(id, alice), 14.75e6);
         assertEq(pot.claimable(id, carol), 0);
+        assertEq(pot.collectableFee(id), 0.5e6);
 
         uint256 aliceBefore = usdc.balanceOf(alice);
         vm.expectEmit(address(pot));
-        emit PushPot.Claimed(id, alice, 15e6);
+        emit PushPot.Claimed(id, alice, 14.75e6);
         vm.prank(alice);
         pot.claim(id);
         vm.prank(bob);
         pot.claim(id);
+        assertEq(usdc.balanceOf(alice), aliceBefore + 14.75e6);
 
-        assertEq(usdc.balanceOf(alice), aliceBefore + 15e6);
+        vm.expectEmit(address(pot));
+        emit PushPot.FeeCollected(id, treasury, 0.5e6);
+        pot.collectFee(id);
+        assertEq(usdc.balanceOf(treasury), 0.5e6);
         assertEq(usdc.balanceOf(address(pot)), 0);
 
         vm.prank(carol);
@@ -459,6 +479,7 @@ contract PushPotTest is Test {
         pot.claim(id);
         vm.prank(bob);
         pot.claim(id);
+        pot.collectFee(id);
 
         assertEq(usdc.balanceOf(address(pot)), 0);
     }
@@ -620,11 +641,166 @@ contract PushPotTest is Test {
     function test_Constructor_BoundsMaxStake() public {
         (uint128 min, uint128 max) = (pot.MIN_STAKE(), pot.MAX_STAKE_LIMIT());
 
+        PushPot.Config memory config = _config();
+        config.maxStake = max + 1;
         vm.expectRevert(PushPot.InvalidParams.selector);
-        new PushPot(address(usdc), oracle, max + 1, owner);
+        new PushPot(config);
 
+        config.maxStake = min - 1;
         vm.expectRevert(PushPot.InvalidParams.selector);
-        new PushPot(address(usdc), oracle, min - 1, owner);
+        new PushPot(config);
+    }
+
+    function test_CollectFee_NothingWhenNobodyOrEverybodyFinishes() public {
+        uint256 nobody = _create();
+        _join(nobody, bob);
+        uint256 everybody = _create();
+        _join(everybody, bob);
+        PushPot.Pot memory p = pot.getPot(everybody);
+        for (uint16 i; i < p.periods; i++) {
+            _warpToPeriod(everybody, i);
+            _checkIn(everybody, alice, i);
+            _checkIn(everybody, bob, i);
+        }
+        _warpPastEnd(everybody);
+
+        for (uint256 id = nobody; id <= everybody; id++) {
+            assertEq(pot.collectableFee(id), 0);
+            vm.expectRevert(PushPot.NothingToClaim.selector);
+            pot.collectFee(id);
+        }
+    }
+
+    function test_CollectFee_RevertsBeforeEndAndOnlyOnce() public {
+        uint256 id = _create();
+        _join(id, bob);
+        _completeAll(id, alice);
+
+        vm.expectRevert(PushPot.NotEnded.selector);
+        pot.collectFee(id);
+
+        _warpPastEnd(id);
+        pot.collectFee(id);
+        vm.expectRevert(PushPot.NothingToClaim.selector);
+        pot.collectFee(id);
+    }
+
+    function test_SetFee_AppliesToNewPotsOnly() public {
+        uint256 before = _create();
+        vm.expectEmit(address(pot));
+        emit PushPot.FeeUpdated(1000);
+        vm.prank(owner);
+        pot.setFee(1000);
+
+        assertEq(pot.getPot(before).feeBps, FEE_BPS);
+        assertEq(pot.getPot(_create()).feeBps, 1000);
+    }
+
+    function test_SetFee_IsCappedAndOwnerOnly() public {
+        uint16 max = pot.MAX_FEE_BPS();
+        vm.prank(owner);
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        pot.setFee(max + 1);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pot.setFee(0);
+    }
+
+    function test_SetTreasury() public {
+        address next = makeAddr("next-treasury");
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pot.setTreasury(next);
+
+        vm.prank(owner);
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        pot.setTreasury(address(0));
+
+        vm.expectEmit(address(pot));
+        emit PushPot.TreasuryUpdated(next);
+        vm.prank(owner);
+        pot.setTreasury(next);
+        assertEq(pot.treasury(), next);
+    }
+
+    function test_Constructor_ValidatesFeeAndTreasury() public {
+        PushPot.Config memory config = _config();
+        config.feeBps = pot.MAX_FEE_BPS() + 1;
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        new PushPot(config);
+
+        config = _config();
+        config.treasury = address(0);
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        new PushPot(config);
+    }
+
+    function test_CreateChallenge_OpensPotWithoutCuratorStake() public {
+        vm.expectEmit(address(pot));
+        emit PushPot.ChallengeCreated(1);
+        vm.prank(curator);
+        uint256 id = pot.createChallenge(_params());
+
+        PushPot.Pot memory p = pot.getPot(id);
+        assertTrue(p.official);
+        assertEq(p.memberCount, 0);
+        assertEq(p.creator, curator);
+        assertFalse(pot.getMember(id, curator).joined);
+        assertEq(usdc.balanceOf(address(pot)), 0);
+
+        _join(id, alice);
+        _join(id, bob);
+        _completeAll(id, alice);
+        _warpPastEnd(id);
+        assertEq(pot.claimable(id, alice), 19.5e6);
+        assertEq(pot.collectableFee(id), 0.5e6);
+    }
+
+    function test_CreateChallenge_AllowsLargerGroups() public {
+        PushPot.PotParams memory p = _params();
+        p.maxMembers = pot.MAX_CHALLENGE_MEMBERS();
+        vm.prank(curator);
+        uint256 id = pot.createChallenge(p);
+        assertEq(pot.getPot(id).maxMembers, p.maxMembers);
+
+        vm.prank(alice);
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        pot.createPot(p);
+    }
+
+    function test_CreateChallenge_OnlyCurator() public {
+        PushPot.PotParams memory p = _params();
+        vm.prank(alice);
+        vm.expectRevert(PushPot.NotCurator.selector);
+        pot.createChallenge(p);
+
+        vm.prank(owner);
+        pot.removeCurator();
+        assertEq(pot.curator(), address(0));
+        vm.prank(curator);
+        vm.expectRevert(PushPot.NotCurator.selector);
+        pot.createChallenge(p);
+    }
+
+    function test_SetCurator_OnlyOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pot.setCurator(alice);
+
+        vm.prank(owner);
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        pot.setCurator(address(0));
+
+        vm.expectEmit(address(pot));
+        emit PushPot.CuratorUpdated(alice);
+        vm.prank(owner);
+        pot.setCurator(alice);
+        assertEq(pot.curator(), alice);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pot.removeCurator();
     }
 
     function test_RenounceOwnership_IsDisabled() public {
@@ -678,6 +854,7 @@ contract PushPotTest is Test {
         _warpPastEnd(id);
         vm.prank(alice);
         pot.claim(id);
+        pot.collectFee(id);
         assertEq(usdc.balanceOf(address(pot)), 0);
     }
 
@@ -728,7 +905,11 @@ contract PushPotTest is Test {
             paid += amount;
         }
 
-        assertEq(paid, uint256(stake) * memberCount);
+        uint256 fee = pot.collectableFee(id);
+        if (fee > 0) pot.collectFee(id);
+
+        assertEq(paid + fee, uint256(stake) * memberCount);
+        assertEq(usdc.balanceOf(treasury), fee);
         assertEq(usdc.balanceOf(address(pot)), 0);
     }
 
