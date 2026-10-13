@@ -21,6 +21,27 @@ function toCameraError(error: unknown): CameraError {
   }
 }
 
+const UPRIGHT = "(orientation: portrait)";
+
+/** Chrome's control over cropping and scaling to the requested size; not in the DOM types yet. */
+type VideoConstraints = MediaTrackConstraints & { resizeMode?: ConstrainDOMString };
+
+/**
+ * Asks for frames shaped like the screen as the phone is held. A landscape request on an upright
+ * phone makes browsers crop a strip out of the middle of the view, cutting off head and hands;
+ * `resizeMode` keeps Chrome from cropping to fit whatever is asked.
+ */
+function videoConstraints(facing: Facing): VideoConstraints {
+  const upright = window.matchMedia(UPRIGHT).matches;
+  return {
+    facingMode: facing,
+    width: { ideal: upright ? 480 : 640 },
+    height: { ideal: upright ? 640 : 480 },
+    frameRate: { ideal: 30, max: 30 },
+    resizeMode: { ideal: "none" },
+  };
+}
+
 export function useCamera(videoRef: RefObject<HTMLVideoElement | null>) {
   const [status, setStatus] = useState<CameraStatus>("idle");
   const [error, setError] = useState<CameraError | null>(null);
@@ -56,15 +77,7 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>) {
       setStatus("starting");
       setError(null);
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: {
-            facingMode: nextFacing,
-            width: { ideal: 640 },
-            height: { ideal: 480 },
-            frameRate: { ideal: 30, max: 30 },
-          },
-        });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints(nextFacing) });
         const video = videoRef.current;
         if (request !== requestRef.current || !video) {
           stream.getTracks().forEach((track) => track.stop());
@@ -95,6 +108,16 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>) {
     document.addEventListener("visibilitychange", onVisibility);
     return () => document.removeEventListener("visibilitychange", onVisibility);
   }, [start, videoRef]);
+
+  // A stream keeps the shape it started with, so turning the phone needs a fresh one.
+  useEffect(() => {
+    const query = window.matchMedia(UPRIGHT);
+    const onRotate = () => {
+      if (streamRef.current) void start(facingRef.current);
+    };
+    query.addEventListener("change", onRotate);
+    return () => query.removeEventListener("change", onRotate);
+  }, [start]);
 
   useEffect(() => stop, [stop]);
 
