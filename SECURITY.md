@@ -27,15 +27,15 @@ checks that none of them can extract a single unit of a member's stake.
 
 | Role | Held by | Can | Can't |
 |---|---|---|---|
-| Owner | the operator's hardware wallet | pause new pots and joins; set the oracle, fee and treasury for future pots; revoke an oracle; change the curator | move funds, change a running pot, block claims or leaving, renounce ownership |
+| Owner | a Safe multisig | pause new pots and joins; set the oracle, fee and treasury for future pots; revoke an oracle; change the curator | move funds, change a running pot, block claims or leaving, renounce ownership |
 | Oracle | the server's hot key | check in a member for the current period | move funds, check anyone in for a closed period |
 | Curator | the server's hot key | open official challenges | stake, join, or touch funds |
-| Treasury | the operator's wallet | receive fees from finished pots | anything else |
+| Treasury | the same Safe | receive fees from finished pots | anything else |
 
 A pot keeps the oracle and fee that were active when it was created. The web app refuses to stake
 into any pot whose oracle isn't PushPot's, so even a stolen owner key couldn't trick players into
-pots judged by someone else. Safe isn't deployed on Arc yet; ownership transfers in two steps so
-it can move to a multisig later.
+pots judged by someone else. Owner actions need several signatures from the Safe, and ownership
+transfers in two steps so it can never be handed to a wrong address by mistake.
 
 ## What you trust the operator for
 
