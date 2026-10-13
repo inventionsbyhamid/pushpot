@@ -44,20 +44,23 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the full design, API and security notes
 
 ## Trust model
 
-The contract holds the money; the server only attests workouts.
+The contract holds the money; the server only attests workouts. See [SECURITY.md](SECURITY.md)
+for the full threat model.
 
-- **Funds:**
-  - stakes can only flow back to members;
-  - the owner can pause new pots, but never claims or withdrawals.
-- **Oracle:**
-  - it can only check in a member for the current period (with a 5 minute grace), so it can't
-    rewrite history;
-  - if it disappears, nobody completes and everyone is refunded.
-- **Known limit.** The rep count comes from the user's device, so a determined cheater can fake
-  it. Server-side recounting and signal checks raise the bar; peer-reviewed proof clips are on
-  the roadmap.
-- **Unaudited.** The contract has unit, fuzz and invariant tests and a clean Slither run, but no
-  audit, so stakes are capped.
+- **Funds only go back to members.** Stakes can only flow back to the members of the pot they
+  were staked in. The owner can pause new pots and joins, but never claims or leaving.
+- **A pot's rules are fixed at creation,** including the oracle that judges it. Changing the
+  oracle only affects pots created afterwards. If an oracle key is compromised, the owner can
+  revoke it: it can no longer check anyone in, so its pots end with everyone refunded.
+- **The oracle's power is narrow.** It can only check in a member for the current period (with a
+  5 minute grace), so it can't rewrite history. If it disappears, nobody completes and everyone
+  is refunded.
+- **Known limit: rep counts come from the user's device.** A determined cheater can fake them.
+  Server-side recounting, replay protection and signal checks raise the bar. Pots are
+  invite-only by link and aren't listed publicly, so you play with people you know.
+- **Unaudited.** The contract has unit, fuzz and stateful invariant tests and a clean Slither
+  run, but no audit, so stakes are capped. It isn't upgradeable: new versions deploy fresh and
+  existing pots settle where they started.
 
 ## Repository
 
