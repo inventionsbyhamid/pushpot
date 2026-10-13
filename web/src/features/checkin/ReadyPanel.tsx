@@ -19,7 +19,7 @@ export function ReadyPanel({ pot, starting, onStart }: ReadyPanelProps) {
     <CheckInPanel
       title={pot ? `${pot.reps_per_period} pushups` : "Today's set"}
       context={pot?.title}
-      body="Put your phone on the floor about two metres away, side-on, with your whole body in frame. Reps are counted on this phone and no video leaves it."
+      body="Put your phone on the floor about two meters away and sideways to the camera, with your whole body in frame. Reps are counted on this phone and no video leaves it."
     >
       {deadline !== null && (
         <p className="text-center text-sm text-amber">

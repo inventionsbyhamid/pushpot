@@ -152,7 +152,7 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
     content = (
       <Status
         title={`Claims open in ${timeUntil(clock.claimsOpenAt)}`}
-        detail="Late check-ins can still land for a few minutes after the end."
+        detail="Workouts finished just before the end can still be recorded for a few minutes."
       />
     );
   } else if (!me) {

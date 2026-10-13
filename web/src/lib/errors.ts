@@ -10,7 +10,7 @@ import { ApiError } from "./api";
 const contractErrors: Record<string, string> = {
   InvalidParams: "The contract rejected these settings. Check the start time and limits.",
   Paused: "New pots and joins are paused right now.",
-  PotNotFound: "This pot doesn't exist on-chain.",
+  PotNotFound: "This pot doesn't exist on Arc.",
   PotFull: "This pot is full.",
   JoiningClosed: "Joining closed when the pot started.",
   AlreadyJoined: "You're already in this pot.",

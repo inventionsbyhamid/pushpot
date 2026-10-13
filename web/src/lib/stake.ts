@@ -52,7 +52,7 @@ export class InsufficientUsdcError extends Error {
 
 export class TxRevertedError extends Error {
   constructor(readonly hash: Hash) {
-    super("The transaction was reverted on-chain.");
+    super("The transaction failed on Arc.");
   }
 }
 
@@ -212,7 +212,7 @@ export async function joinPot(
     pot.feeBps === terms.feeBps;
   if (!matches) {
     throw new Error(
-      "This pot's on-chain terms differ from what's shown. Reload the page and review them.",
+      "This pot's terms on Arc differ from what's shown. Reload the page and review them.",
     );
   }
   const stake = pot.stake;
