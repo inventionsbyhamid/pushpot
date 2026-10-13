@@ -42,12 +42,13 @@ could gain. We'll acknowledge reports within 48 hours.
 ### Known limitations
 
 - **Rep counts come from the user's device.** The server validates the telemetry and recounts
-  reps from the raw angle trace, but a determined attacker can forge a plausible trace. Play with
-  people you know. Pots are joined by invite link and aren't listed publicly.
-- **The contracts are unaudited.** Stakes are capped per member (`maxStake`, set at deploy) and
-  pots are capped at 50 members.
-- **The owner is a single key.** Safe isn't deployed on Arc yet. Ownership uses a two-step
-  transfer so it can move to a multisig later.
+  reps from the raw angle trace, but a determined attacker can forge a plausible trace. Private pots
+  are joined by invite link and never listed; only official challenges are public, and they
+  carry small stakes.
+- **The contracts are unaudited.** Stakes are capped per member (`maxStake`, set at deploy).
+  Private pots hold at most 50 members and official challenges at most 1,000.
+- **The owner is a single key.** Safe isn't deployed on Arc yet. Ownership transfers in two
+  steps, so it can move to a multisig later.
 
 ## Testing
 
@@ -60,3 +61,10 @@ The CI workflow runs on every push:
   - Slither.
 - **Server:** integration tests against Postgres, plus clippy with warnings denied.
 - **Web:** unit tests for the rep counter and telemetry.
+
+## Secrets
+
+- Every `.env` file is ignored by git. Each part of the repo ships an `.env.example` instead.
+- A git hook in `.githooks` checks every commit and refuses `.env` files or any change containing
+  a secret from your local `.env` files. Turn it on with `git config core.hooksPath .githooks`.
+- CI scans the full git history for leaked credentials with gitleaks.

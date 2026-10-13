@@ -1,0 +1,29 @@
+#!/bin/sh
+# Refuses commits that would leak local secrets.
+# Enable once per clone with: git config core.hooksPath .githooks
+set -eu
+
+for file in $(git diff --cached --name-only --diff-filter=ACMR); do
+  case "$(basename "$file")" in
+    .env.example) ;;
+    .env | .env.* | *.pem | *.key)
+      echo "pre-commit: refusing to commit $file" >&2
+      exit 1
+      ;;
+  esac
+done
+
+staged=$(git diff --cached --no-color -U0)
+secrets=$(cat .env server/.env web/.env.local contracts/.env 2>/dev/null |
+  grep -E '^[A-Z0-9_]*(KEY|SECRET|TOKEN|PASSWORD)[A-Z0-9_]*=' | cut -d= -f2- || true)
+
+IFS='
+'
+for value in $secrets; do
+  value=${value#0x}
+  [ ${#value} -ge 16 ] || continue
+  if printf '%s' "$staged" | grep -qiF -- "$value"; then
+    echo "pre-commit: staged changes contain a secret from a local .env file" >&2
+    exit 1
+  fi
+done
