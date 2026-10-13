@@ -15,12 +15,20 @@ export function AppShell() {
           <Link to="/" aria-label="PushPot home" className="-ml-1 rounded-md px-1 py-2">
             <Wordmark />
           </Link>
-          <ConnectButton
-            label="Connect"
-            showBalance={false}
-            chainStatus="icon"
-            accountStatus={{ smallScreen: "avatar", largeScreen: "address" }}
-          />
+          <div className="flex items-center gap-1">
+            <Link
+              to="/guide"
+              className="inline-flex min-h-11 items-center rounded-md px-2 text-sm font-semibold text-mute hover:text-chalk"
+            >
+              How to
+            </Link>
+            <ConnectButton
+              label="Connect"
+              showBalance={false}
+              chainStatus="icon"
+              accountStatus={{ smallScreen: "avatar", largeScreen: "address" }}
+            />
+          </div>
         </div>
       </header>
       <OpenInMetaMask />

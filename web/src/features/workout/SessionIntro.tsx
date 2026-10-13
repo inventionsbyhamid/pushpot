@@ -1,4 +1,5 @@
 import { Button } from "../../components/Button";
+import { WorkoutPrep } from "../guide/WorkoutPrep";
 import { CloseIcon } from "./icons";
 
 const TIPS = [
@@ -47,6 +48,8 @@ export function SessionIntro({ target, onStart, onExit }: SessionIntroProps) {
             </li>
           ))}
         </ol>
+
+        <WorkoutPrep />
 
         <div className="flex flex-col gap-3">
           <Button onClick={onStart} className="w-full">

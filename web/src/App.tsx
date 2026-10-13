@@ -10,6 +10,7 @@ const Practice = lazy(() => import("./pages/Practice"));
 const CreatePot = lazy(() => import("./pages/CreatePot"));
 const PotPage = lazy(() => import("./pages/PotPage"));
 const PotWorkout = lazy(() => import("./pages/PotWorkout"));
+const Guide = lazy(() => import("./pages/Guide"));
 
 const router = createBrowserRouter([
   {
@@ -22,6 +23,7 @@ const router = createBrowserRouter([
           { index: true, element: <Home /> },
           { path: "create", element: <CreatePot /> },
           { path: "p/:id", element: <PotPage /> },
+          { path: "guide", element: <Guide /> },
           { path: "*", element: <NotFound /> },
         ],
       },

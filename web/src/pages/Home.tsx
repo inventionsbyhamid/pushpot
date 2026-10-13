@@ -2,6 +2,7 @@ import { useMemo, type ReactNode } from "react";
 import { Button, ButtonLink } from "../components/Button";
 import { PotList } from "../components/PotList";
 import { ChallengeHub } from "../features/challenges/ChallengeHub";
+import { PushupDemo } from "../features/guide/PushupDemo";
 import { usePosePrefetch } from "../features/workout/usePosePrefetch";
 import { useAuth } from "../lib/auth";
 import { describeError } from "../lib/errors";
@@ -52,6 +53,8 @@ export default function Home() {
         </p>
       </section>
 
+      <PushupDemo className="mb-12" />
+
       <ChallengeHub joined={joined} />
 
       {signedIn && (
@@ -75,6 +78,19 @@ export default function Home() {
             </li>
           ))}
         </ol>
+      </section>
+
+      <section className="mt-12 rounded-2xl border border-line bg-panel px-4 py-5" aria-labelledby="do-it-right">
+        <h2 id="do-it-right" className="font-display text-4xl font-extrabold">
+          Do it right
+        </h2>
+        <p className="mt-2 text-mute">
+          A rep counts when you go down to about 90°, lock out at the top and keep your body in one
+          straight line. Set your phone on the floor, sideways to you, with your whole body in frame.
+        </p>
+        <ButtonLink to="/guide" variant="secondary" className="mt-4 w-full">
+          Read the guide
+        </ButtonLink>
       </section>
     </>
   );
