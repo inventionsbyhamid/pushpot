@@ -8,10 +8,11 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 contract PushPotHandler is Test {
     PushPot internal immutable pot;
     MockUSDC internal immutable usdc;
-    address internal immutable oracle;
 
     address[] internal actors;
+    address[] internal oracles;
     uint256[] public potIds;
+    mapping(uint256 potId => address) public oracleAtCreation;
 
     uint256 public deposited;
     uint256 public withdrawn;
@@ -24,11 +25,13 @@ contract PushPotHandler is Test {
         _;
     }
 
-    constructor(PushPot pot_, MockUSDC usdc_, address oracle_) {
+    constructor(PushPot pot_, MockUSDC usdc_) {
         pot = pot_;
         usdc = usdc_;
-        oracle = oracle_;
         currentTime = block.timestamp;
+        oracles.push(pot_.oracle());
+        oracles.push(makeAddr("oracle-b"));
+        oracles.push(makeAddr("oracle-c"));
         for (uint256 i; i < 5; i++) {
             address actor = address(uint160(0xA000 + i));
             actors.push(actor);
@@ -49,7 +52,7 @@ contract PushPotHandler is Test {
         address actor = _actor(actorSeed);
         PushPot.PotParams memory p = PushPot.PotParams({
             title: "fuzz",
-            stake: uint128(bound(stake, 1, pot.maxStake())),
+            stake: uint128(bound(stake, pot.MIN_STAKE(), pot.maxStake())),
             repsPerPeriod: 10,
             periods: uint16(bound(periods, 1, 3)),
             periodSeconds: pot.MIN_PERIOD(),
@@ -57,9 +60,11 @@ contract PushPotHandler is Test {
             maxMembers: uint16(bound(maxMembers, 2, actors.length))
         });
         vm.prank(actor);
-        uint256 id = pot.createPot(p);
-        potIds.push(id);
-        deposited += p.stake;
+        try pot.createPot(p) returns (uint256 id) {
+            potIds.push(id);
+            oracleAtCreation[id] = pot.oracle();
+            deposited += p.stake;
+        } catch {}
     }
 
     function join(uint256 potSeed, uint256 actorSeed) external useCurrentTime {
@@ -87,10 +92,19 @@ contract PushPotHandler is Test {
         if (period == type(uint256).max) return;
         for (uint256 i; i < actors.length; i++) {
             if (memberMask & (1 << i) == 0) continue;
-            vm.prank(oracle);
+            vm.prank(pot.getPot(id).oracle);
             try pot.checkIn(id, actors[i], uint16(period), 10, bytes32(0)) {
                 checkIns++;
             } catch {}
+        }
+    }
+
+    function rotateOracle(uint256 seed) external {
+        address candidate = oracles[seed % oracles.length];
+        if (seed % 5 == 0) {
+            pot.revokeOracle(candidate);
+        } else {
+            try pot.setOracle(candidate) {} catch {}
         }
     }
 
@@ -129,9 +143,11 @@ contract PushPotInvariantTest is Test {
     function setUp() public {
         vm.warp(1_800_000_000);
         usdc = new MockUSDC();
-        address oracle = makeAddr("oracle");
-        pot = new PushPot(address(usdc), oracle, 50e6, address(this));
-        handler = new PushPotHandler(pot, usdc, oracle);
+        pot = new PushPot(address(usdc), makeAddr("oracle"), 50e6, address(this));
+        handler = new PushPotHandler(pot, usdc);
+        pot.transferOwnership(address(handler));
+        vm.prank(address(handler));
+        pot.acceptOwnership();
         targetContract(address(handler));
     }
 
@@ -149,5 +165,12 @@ contract PushPotInvariantTest is Test {
             owed += total - p.paidOut;
         }
         assertEq(usdc.balanceOf(address(pot)), owed);
+    }
+
+    function invariant_PotsKeepTheirOracle() public view {
+        for (uint256 i; i < handler.potCount(); i++) {
+            uint256 id = handler.potIds(i);
+            assertEq(pot.getPot(id).oracle, handler.oracleAtCreation(id));
+        }
     }
 }

@@ -123,7 +123,7 @@ contract PushPotTest is Test {
         PushPot.PotParams memory p;
 
         p = _params();
-        p.stake = 0;
+        p.stake = pot.MIN_STAKE() - 1;
         _expectInvalid(p);
 
         p = _params();
@@ -168,6 +168,14 @@ contract PushPotTest is Test {
 
         p = _params();
         p.title = "";
+        _expectInvalid(p);
+
+        p = _params();
+        p.title = "gm\x00";
+        _expectInvalid(p);
+
+        p = _params();
+        p.title = "line\nbreak";
         _expectInvalid(p);
 
         p = _params();
@@ -436,7 +444,7 @@ contract PushPotTest is Test {
 
     function test_Claim_LastCompleterGetsRemainder() public {
         PushPot.PotParams memory p = _params();
-        p.stake = 1;
+        p.stake = pot.MIN_STAKE() + 1;
         p.periods = 1;
         uint256 id = _createWith(p);
         _join(id, bob);
@@ -538,6 +546,101 @@ contract PushPotTest is Test {
         assertEq(pot.oracle(), next);
     }
 
+    function test_CreatePot_RecordsCurrentOracle() public {
+        uint256 id = _create();
+        assertEq(pot.getPot(id).oracle, oracle);
+    }
+
+    function test_SetOracle_DoesNotChangeExistingPots() public {
+        uint256 id = _create();
+        address next = makeAddr("next");
+        vm.prank(owner);
+        pot.setOracle(next);
+
+        _warpToPeriod(id, 0);
+        vm.prank(next);
+        vm.expectRevert(PushPot.NotOracle.selector);
+        pot.checkIn(id, alice, 0, 10, bytes32(0));
+
+        _checkIn(id, alice, 0);
+        assertEq(pot.getMember(id, alice).checkIns, 1);
+
+        vm.prank(alice);
+        uint256 later = pot.createPot(_params());
+        assertEq(pot.getPot(later).oracle, next);
+    }
+
+    function test_RevokeOracle_StopsCheckInsAndRefundsEveryone() public {
+        uint256 id = _create();
+        _join(id, bob);
+        _warpToPeriod(id, 0);
+        _checkIn(id, alice, 0);
+
+        vm.expectEmit(address(pot));
+        emit PushPot.OracleRevoked(oracle);
+        vm.prank(owner);
+        pot.revokeOracle(oracle);
+        assertEq(pot.oracle(), address(0));
+
+        _warpToPeriod(id, 1);
+        vm.prank(oracle);
+        vm.expectRevert(PushPot.NotOracle.selector);
+        pot.checkIn(id, alice, 1, 10, bytes32(0));
+
+        _warpPastEnd(id);
+        assertEq(pot.claimable(id, alice), STAKE);
+        assertEq(pot.claimable(id, bob), STAKE);
+    }
+
+    function test_RevokeOracle_BlocksNewPotsUntilReplaced() public {
+        vm.prank(owner);
+        pot.revokeOracle(oracle);
+
+        PushPot.PotParams memory p = _params();
+        vm.prank(alice);
+        vm.expectRevert(PushPot.Paused.selector);
+        pot.createPot(p);
+
+        vm.prank(owner);
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        pot.setOracle(oracle);
+
+        address next = makeAddr("next");
+        vm.prank(owner);
+        pot.setOracle(next);
+        assertEq(pot.getPot(_createWith(p)).oracle, next);
+    }
+
+    function test_RevokeOracle_OnlyOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pot.revokeOracle(oracle);
+    }
+
+    function test_Constructor_BoundsMaxStake() public {
+        (uint128 min, uint128 max) = (pot.MIN_STAKE(), pot.MAX_STAKE_LIMIT());
+
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        new PushPot(address(usdc), oracle, max + 1, owner);
+
+        vm.expectRevert(PushPot.InvalidParams.selector);
+        new PushPot(address(usdc), oracle, min - 1, owner);
+    }
+
+    function test_RenounceOwnership_IsDisabled() public {
+        vm.prank(owner);
+        vm.expectRevert(PushPot.RenounceDisabled.selector);
+        pot.renounceOwnership();
+        assertEq(pot.owner(), owner);
+    }
+
+    function test_CreatePot_AcceptsUnicodeTitle() public {
+        PushPot.PotParams memory p = _params();
+        p.title = unicode"Morgenrunde 💪";
+        uint256 id = _createWith(p);
+        assertEq(pot.getPot(id).creator, alice);
+    }
+
     function test_SetOracle_OnlyOwner() public {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
@@ -590,7 +693,7 @@ contract PushPotTest is Test {
         public
     {
         memberCount = uint8(bound(memberCount, 2, 20));
-        stake = uint128(bound(stake, 1, MAX_STAKE));
+        stake = uint128(bound(stake, pot.MIN_STAKE(), MAX_STAKE));
 
         PushPot.PotParams memory p = _params();
         p.stake = stake;

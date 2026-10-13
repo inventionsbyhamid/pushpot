@@ -12,10 +12,13 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 /// @notice Group pushup challenges with USDC stakes. Members who check in every period split
 /// the whole pot; if nobody completes, everyone is refunded. Check-ins are submitted by an
 /// oracle that verifies workouts off-chain, and are only accepted inside the period window.
-/// Neither the owner nor the oracle can move staked funds.
+/// Each pot is bound to the oracle that was active when it was created, so its rules can't
+/// change after people join. Neither the owner nor the oracle can move staked funds.
 contract PushPot is Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
+    uint128 public constant MIN_STAKE = 1e6;
+    uint128 public constant MAX_STAKE_LIMIT = 1e12;
     uint32 public constant MIN_PERIOD = 10 minutes;
     uint32 public constant MAX_PERIOD = 7 days;
     uint16 public constant MAX_PERIODS = 90;
@@ -46,7 +49,8 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         uint16 completerCount;
         uint16 claimedCount;
         uint128 stake;
-        uint128 paidOut;
+        uint96 paidOut;
+        address oracle;
     }
 
     struct Member {
@@ -58,7 +62,9 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
 
     IERC20 public immutable usdc;
     uint128 public immutable maxStake;
+    /// @notice Oracle assigned to new pots; zero after a revocation until a new one is set.
     address public oracle;
+    mapping(address oracle => bool) public revokedOracles;
     bool public paused;
     uint256 public potCount;
 
@@ -87,6 +93,7 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
     );
     event Claimed(uint256 indexed potId, address indexed member, uint256 amount);
     event OracleUpdated(address indexed oracle);
+    event OracleRevoked(address indexed oracle);
     event PausedSet(bool paused);
 
     error InvalidParams();
@@ -102,14 +109,13 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
     error AlreadyCheckedIn();
     error NotEnded();
     error NothingToClaim();
-
-    modifier onlyOracle() {
-        if (msg.sender != oracle) revert NotOracle();
-        _;
-    }
+    error RenounceDisabled();
 
     constructor(address usdc_, address oracle_, uint128 maxStake_, address owner_) Ownable(owner_) {
-        if (usdc_ == address(0) || oracle_ == address(0) || maxStake_ == 0) {
+        if (
+            usdc_ == address(0) || oracle_ == address(0) || maxStake_ < MIN_STAKE
+                || maxStake_ > MAX_STAKE_LIMIT
+        ) {
             revert InvalidParams();
         }
         usdc = IERC20(usdc_);
@@ -167,8 +173,9 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         uint16 period,
         uint16 reps,
         bytes32 evidenceHash
-    ) external onlyOracle {
+    ) external {
         Pot storage pot = _getPot(potId);
+        if (msg.sender != pot.oracle || revokedOracles[msg.sender]) revert NotOracle();
         Member storage member = _members[potId][account];
         if (!member.joined) revert NotMember();
         if (reps < pot.repsPerPeriod) revert NotEnoughReps();
@@ -197,7 +204,7 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
 
         member.claimed = true;
         pot.claimedCount++;
-        pot.paidOut += SafeCast.toUint128(amount);
+        pot.paidOut += SafeCast.toUint96(amount);
 
         emit Claimed(potId, msg.sender, amount);
         usdc.safeTransfer(msg.sender, amount);
@@ -210,10 +217,24 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         emit PausedSet(paused_);
     }
 
+    /// @dev Without an owner nobody could pause new pots or rotate a compromised oracle.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
+
+    /// @notice Sets the oracle for pots created from now on. Existing pots keep theirs.
     function setOracle(address oracle_) external onlyOwner {
-        if (oracle_ == address(0)) revert InvalidParams();
+        if (oracle_ == address(0) || revokedOracles[oracle_]) revert InvalidParams();
         oracle = oracle_;
         emit OracleUpdated(oracle_);
+    }
+
+    /// @notice Emergency switch for a compromised oracle key: it can no longer check anyone in,
+    /// so its pots end without completers and every member is refunded.
+    function revokeOracle(address oracle_) external onlyOwner {
+        revokedOracles[oracle_] = true;
+        if (oracle == oracle_) oracle = address(0);
+        emit OracleRevoked(oracle_);
     }
 
     function getPot(uint256 potId) external view returns (Pot memory) {
@@ -244,10 +265,10 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
     }
 
     function _createPot(PotParams calldata params) private returns (uint256 potId) {
-        if (paused) revert Paused();
+        if (paused || oracle == address(0)) revert Paused();
         uint256 titleLength = bytes(params.title).length;
         if (
-            params.stake == 0 || params.stake > maxStake || params.repsPerPeriod == 0
+            params.stake < MIN_STAKE || params.stake > maxStake || params.repsPerPeriod == 0
                 || params.repsPerPeriod > MAX_REPS || params.periods == 0
                 || params.periods > MAX_PERIODS || params.periodSeconds < MIN_PERIOD
                 || params.periodSeconds > MAX_PERIOD || params.startTime <= block.timestamp
@@ -255,6 +276,7 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
                 || params.maxMembers > MAX_MEMBERS || titleLength == 0
                 || titleLength > MAX_TITLE_BYTES
         ) revert InvalidParams();
+        _requirePrintable(params.title);
 
         potId = ++potCount;
         _pots[potId] = Pot({
@@ -268,7 +290,8 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
             completerCount: 0,
             claimedCount: 0,
             stake: params.stake,
-            paidOut: 0
+            paidOut: 0,
+            oracle: oracle
         });
 
         emit PotCreated(
@@ -310,6 +333,16 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         try IERC20Permit(address(usdc))
             .permit(msg.sender, address(this), value, deadline, v, r, s) {}
             catch {}
+    }
+
+    /// @dev Titles are shown in apps and indexed off-chain; control characters only cause trouble.
+    function _requirePrintable(string calldata title) private pure {
+        bytes calldata raw = bytes(title);
+        bool printable = true;
+        for (uint256 i; i < raw.length; ++i) {
+            printable = printable && raw[i] >= 0x20 && raw[i] != 0x7f;
+        }
+        if (!printable) revert InvalidParams();
     }
 
     function _getPot(uint256 potId) private view returns (Pot storage pot) {
