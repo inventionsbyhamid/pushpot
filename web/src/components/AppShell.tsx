@@ -50,6 +50,7 @@ export function AppShell() {
           Contract
         </ExternalLink>
         <span>Running on {chain.name}</span>
+        <span>iPhone and Android apps coming soon</span>
       </footer>
     </div>
   );

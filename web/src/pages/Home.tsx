@@ -1,4 +1,5 @@
 import { useMemo, type ReactNode } from "react";
+import { AppsComingSoon } from "../components/AppsComingSoon";
 import { Button, ButtonLink } from "../components/Button";
 import { PotList } from "../components/PotList";
 import { ChallengeHub } from "../features/challenges/ChallengeHub";
@@ -80,18 +81,24 @@ export default function Home() {
         </ol>
       </section>
 
-      <section className="mt-12 rounded-2xl border border-line bg-panel px-4 py-5" aria-labelledby="do-it-right">
+      <section
+        className="mt-12 rounded-2xl border border-line bg-panel px-4 py-5"
+        aria-labelledby="do-it-right"
+      >
         <h2 id="do-it-right" className="font-display text-4xl font-extrabold">
           Do it right
         </h2>
         <p className="mt-2 text-mute">
           A rep counts when you go down to about 90°, lock out at the top and keep your body in one
-          straight line. Set your phone on the floor, sideways to you, with your whole body in frame.
+          straight line. Set your phone on the floor, sideways to you, with your whole body in
+          frame.
         </p>
         <ButtonLink to="/guide" variant="secondary" className="mt-4 w-full">
           Read the guide
         </ButtonLink>
       </section>
+
+      <AppsComingSoon />
     </>
   );
 }
