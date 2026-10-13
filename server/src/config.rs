@@ -16,6 +16,10 @@ pub struct Config {
     pub oracle_signer: PrivateKeySigner,
     pub web_dir: PathBuf,
     pub indexer_interval: Duration,
+    /// Opens the official challenges in the catalog. Off for test deployments.
+    pub curator_enabled: bool,
+    /// Sends finished pots' fees to the treasury.
+    pub fee_collector_enabled: bool,
 }
 
 impl Config {
@@ -54,6 +58,8 @@ impl Config {
                     .parse()
                     .context("INDEXER_INTERVAL_MS")?,
             ),
+            curator_enabled: flag("CURATOR_ENABLED", true)?,
+            fee_collector_enabled: flag("FEE_COLLECTOR_ENABLED", true)?,
         })
     }
 
@@ -83,4 +89,15 @@ fn required(key: &str) -> Result<String> {
 
 fn optional(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+fn flag(key: &str, default: bool) -> Result<bool> {
+    let Ok(value) = env::var(key) else {
+        return Ok(default);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{key} must be true or false"),
+    }
 }

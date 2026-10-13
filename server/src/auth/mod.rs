@@ -74,7 +74,7 @@ async fn verify(
         return Err(AppError::TooManyRequests);
     }
     if req.message.len() > 4096 {
-        return Err(AppError::BadRequest("sign-in message is too long".into()));
+        return Err(AppError::BadRequest("sign in message is too long".into()));
     }
 
     let message =
@@ -98,7 +98,7 @@ async fn verify(
     .await?;
     if consumed.rows_affected() != 1 {
         return Err(AppError::Unprocessable(
-            "sign-in request expired, please try again".into(),
+            "sign in request expired, please try again".into(),
         ));
     }
 

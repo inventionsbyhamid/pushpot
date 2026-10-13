@@ -78,7 +78,7 @@ pub async fn require_same_origin(
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok());
         if origin != Some(state.config.origin().as_str()) {
-            return AppError::Forbidden("cross-origin request blocked".into()).into_response();
+            return AppError::Forbidden("cross origin request blocked".into()).into_response();
         }
     }
     next.run(req).await

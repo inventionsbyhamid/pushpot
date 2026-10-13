@@ -18,6 +18,34 @@ sol! {
     #[allow(clippy::too_many_arguments)]
     #[sol(rpc)]
     interface IPushPot {
+        struct PotParams {
+            string title;
+            uint128 stake;
+            uint16 repsPerPeriod;
+            uint16 periods;
+            uint32 periodSeconds;
+            uint64 startTime;
+            uint16 maxMembers;
+        }
+
+        struct Pot {
+            address creator;
+            uint64 startTime;
+            uint32 periodSeconds;
+            uint16 periods;
+            uint16 repsPerPeriod;
+            uint16 maxMembers;
+            uint16 memberCount;
+            uint16 completerCount;
+            uint16 claimedCount;
+            uint16 feeBps;
+            bool feeCollected;
+            bool official;
+            uint128 stake;
+            uint96 paidOut;
+            address oracle;
+        }
+
         event PotCreated(
             uint256 indexed potId,
             address indexed creator,
@@ -29,6 +57,7 @@ sol! {
             uint64 startTime,
             uint16 maxMembers
         );
+        event ChallengeCreated(uint256 indexed potId);
         event Joined(uint256 indexed potId, address indexed member);
         event Left(uint256 indexed potId, address indexed member);
         event CheckedIn(
@@ -39,17 +68,28 @@ sol! {
             bytes32 evidenceHash
         );
         event Claimed(uint256 indexed potId, address indexed member, uint256 amount);
+        event FeeCollected(uint256 indexed potId, address indexed treasury, uint256 amount);
 
+        error InvalidParams();
         error Paused();
         error PotNotFound();
         error NotMember();
         error NotOracle();
+        error NotCurator();
         error NotEnoughReps();
         error OutsideWindow();
         error AlreadyCheckedIn();
+        error NotEnded();
+        error NothingToClaim();
 
         function checkIn(uint256 potId, address member, uint16 period, uint16 reps, bytes32 evidenceHash) external;
+        function createChallenge(PotParams params) external returns (uint256 potId);
+        function collectFee(uint256 potId) external returns (uint256 fee);
+        function getPot(uint256 potId) external view returns (Pot memory);
         function getMember(uint256 potId, address account) external view returns (bool joined, bool claimed, uint16 checkIns, uint128 periodBits);
+        function collectableFee(uint256 potId) external view returns (uint256);
+        function curator() external view returns (address);
+        function maxStake() external view returns (uint128);
     }
 
     interface IERC1271 {
@@ -91,11 +131,43 @@ impl Chain {
         })
     }
 
+    fn pushpot(&self) -> IPushPot::IPushPotInstance<&DynProvider> {
+        IPushPot::new(self.contract, &self.provider)
+    }
+
     /// Reads membership straight from the contract, for when the indexer hasn't caught up.
     pub async fn is_member(&self, pot_id: u64, account: Address) -> Result<bool, ContractError> {
-        let pot = IPushPot::new(self.contract, &self.provider);
-        let member = pot.getMember(U256::from(pot_id), account).call().await?;
+        let member = self
+            .pushpot()
+            .getMember(U256::from(pot_id), account)
+            .call()
+            .await?;
         Ok(member.joined)
+    }
+
+    /// The pot's fee in basis points, fixed when it was created. `PotCreated` doesn't carry it.
+    pub async fn fee_bps(&self, pot_id: u64) -> Result<u16, ContractError> {
+        Ok(self
+            .pushpot()
+            .getPot(U256::from(pot_id))
+            .call()
+            .await?
+            .feeBps)
+    }
+
+    pub async fn collectable_fee(&self, pot_id: u64) -> Result<U256, ContractError> {
+        self.pushpot()
+            .collectableFee(U256::from(pot_id))
+            .call()
+            .await
+    }
+
+    pub async fn curator(&self) -> Result<Address, ContractError> {
+        self.pushpot().curator().call().await
+    }
+
+    pub async fn max_stake(&self) -> Result<u128, ContractError> {
+        self.pushpot().maxStake().call().await
     }
 
     /// ERC-1271 check for smart-contract wallets signing an EIP-191 message.

@@ -4,14 +4,17 @@ use serde::Serialize;
 use sqlx::PgPool;
 use tokio::sync::{Semaphore, broadcast};
 
-use crate::{chain::Chain, chain::oracle::CheckInSender, config::Config, http::RateLimiter};
+use crate::{
+    api::challenges::ChallengeCache, chain::Chain, chain::oracle::OracleSender, config::Config,
+    http::RateLimiter,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     pub config: Arc<Config>,
     pub chain: Chain,
-    pub oracle: Arc<dyn CheckInSender>,
+    pub oracle: Arc<dyn OracleSender>,
     pub events: broadcast::Sender<PotEvent>,
     /// Keyed by client IP.
     pub auth_limiter: Arc<RateLimiter>,
@@ -19,6 +22,7 @@ pub struct AppState {
     pub workout_limiter: Arc<RateLimiter>,
     /// One permit per open event stream.
     pub event_streams: Arc<Semaphore>,
+    pub challenge_cache: Arc<ChallengeCache>,
     /// The built `index.html`, used to render link previews. `None` when the web app isn't built.
     pub index_html: Option<Arc<str>>,
 }

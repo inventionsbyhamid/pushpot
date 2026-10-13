@@ -1,8 +1,10 @@
 mod api;
 mod auth;
 mod chain;
+mod challenges;
 mod config;
 mod error;
+mod fees;
 mod http;
 mod pots;
 mod share;
@@ -23,6 +25,7 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    api::challenges::ChallengeCache,
     chain::{Chain, oracle::Oracle},
     config::Config,
     http::RateLimiter,
@@ -69,12 +72,23 @@ async fn main() -> anyhow::Result<()> {
         auth_limiter: Arc::new(RateLimiter::new(30, Duration::from_secs(60))),
         workout_limiter: Arc::new(RateLimiter::new(20, Duration::from_secs(60))),
         event_streams: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
+        challenge_cache: Arc::new(ChallengeCache::default()),
         index_html: std::fs::read_to_string(config.web_dir.join("index.html"))
             .ok()
             .map(Into::into),
     };
 
     tokio::spawn(chain::indexer::run(state.clone()));
+    if config.curator_enabled {
+        tokio::spawn(challenges::run(state.clone()));
+    } else {
+        tracing::info!("curator disabled: not opening official challenges");
+    }
+    if config.fee_collector_enabled {
+        tokio::spawn(fees::run(state.clone()));
+    } else {
+        tracing::info!("fee collector disabled");
+    }
     tokio::spawn(sweep_stuck_workouts(db.clone()));
     tokio::spawn(prune_expired(db));
 

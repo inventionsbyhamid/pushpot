@@ -134,14 +134,19 @@ everything the indexer needs.
   rather than retried forever, which would stall every join and check-in after it. Titles are
   stripped of control characters. RPC and connection errors retry the whole batch, and 15
   failed attempts in a row log an error.
+- `PotCreated` doesn't carry the fee, so the indexer reads each new pot's `feeBps` with
+  `getPot`. A failed read retries the batch. `ChallengeCreated` marks a pot as official, and
+  `FeeCollected` records what went to the treasury.
 - Arc's finality is deterministic, so there is no reorg handling.
 - After a commit, the indexer publishes events to SSE subscribers.
 
 **Oracle.**
 
-- One task owns the oracle key, so nonces never race.
-- Requests arrive over a channel. The task sends `checkIn` with `maxFeePerGas` ≥ 20 gwei
-  (Arc's floor: anything lower is silently dropped), then polls for the receipt.
+- One task owns the oracle key, so nonces never race. It sends `checkIn`, `createChallenge` (in
+  deployment the oracle key is also the curator) and `collectFee`.
+- Requests arrive over a channel. The task simulates each call, sends it with
+  `maxFeePerGas` ≥ 20 gwei (Arc's floor: anything lower is silently dropped), then polls for
+  the receipt and logs what it cost.
 - A request that waited more than 30 s in the queue fails without being sent, so a backlog
   clears quickly and the member can retry.
 - A check-in costs roughly $0.002 and confirms in about a second.
@@ -165,6 +170,42 @@ everything the indexer needs.
   complete again.
 - Both endpoints are rate-limited to 20 requests a minute per address.
 
+**Official challenges.** The server opens challenges from a fixed catalog, so there is always a
+cohort anyone can join without an invite. Every instance starts at 00:00 UTC and takes up to
+1,000 members.
+
+| Key | Name | Tier | Reps | Length | Stake | Starts | Kept open |
+|---|---|---|---|---|---|---|---|
+| `daily-20` | Daily 20 | rookie | 20 | 1 day | 1 USDC | every day | next 2 |
+| `daily-50` | Daily 50 | regular | 50 | 1 day | 2 USDC | every day | next 2 |
+| `daily-100` | Daily 100 | beast | 100 | 1 day | 5 USDC | every day | next 2 |
+| `kickoff` | Monday Kickoff | rookie | 20 a day | 7 days | 3 USDC | Mondays | next 2 |
+| `iron-week` | Iron Week | beast | 50 a day | 7 days | 5 USDC | Mondays | next 2 |
+| `weekend-warrior` | Weekend Warrior | regular | 50 a day | 2 days | 2 USDC | Saturdays | next 2 |
+| `thirty-day` | 30 Day Challenge | regular | 25 a day | the whole month | 5 USDC | the 1st | next 1 |
+| `club-52` | 52 Week Club | beast | 100 a week | 52 weeks | 10 USDC | first Monday of each month | next 1 |
+
+- The scheduler runs at startup and every 10 minutes, when `CURATOR_ENABLED` is on and the
+  contract's `curator` is the oracle key.
+- Only starts more than an hour and less than 30 days away (the contract's `MAX_START_DELAY`)
+  are opened. A template staked above the contract's `maxStake` is skipped with a warning.
+- Titles stay within 48 bytes: "Daily 50 · Oct 14", "Iron Week · Oct 19", "30 Day · November",
+  "52 Week Club · Nov 2026".
+- Each instance is claimed as a `pending` row in `challenges`, keyed by template and start,
+  before `createChallenge` goes out through the oracle task. The new pot's id comes from the
+  receipt's `PotCreated` log. A refused transaction frees the row so the next run tries again;
+  an unconfirmed one stays `pending`.
+- A `pending` row older than 2 minutes is reconciled against the curator's `PotCreated` logs
+  since the block recorded with it. If the pot is there, the row is completed; if not, the row
+  is released and the instance opened again. A crash or restart therefore never opens an
+  instance twice.
+
+**Fees.** Each pot keeps the fee rate it was created with, taken only from forfeited stakes.
+When `FEE_COLLECTOR_ENABLED` is on, every 10 minutes the server looks for pots that stopped
+accepting check-ins (end plus grace), have a fee rate, and have no fee on record. For each it
+reads `collectableFee`: if it's positive, it sends `collectFee` through the oracle task,
+otherwise it records 0. `collectFee` only ever pays the treasury, so anyone may call it.
+
 ### API
 
 All JSON uses snake_case. Amounts are in USDC base units (6 decimals) as integers.
@@ -175,7 +216,8 @@ All JSON uses snake_case. Amounts are in USDC base units (6 decimals) as integer
 | `POST /api/auth/verify {message, signature}` | `{address}` + session cookie |
 | `POST /api/auth/logout` | `204` |
 | `GET /api/me` | `{address}` or `401` |
-| `GET /api/pots` | the caller's pots, `{pots: Pot[]}`, or `401`. Pots are invite-only, so there is no public listing. |
+| `GET /api/pots` | the caller's pots, `{pots: Pot[]}`, or `401`. Private pots are invite-only, so there is no public listing. |
+| `GET /api/challenges` | `{challenges: Challenge[]}`: official challenges that haven't ended, soonest first. No sign-in; cached for 5 s. |
 | `GET /api/pots/:id` | `{pot: Pot, members: Member[]}` |
 | `GET /api/pots/:id/events` | SSE: `joined`, `left`, `checked_in`, `claimed`; `404` for an unknown pot, `503` while 2,000 streams are open |
 | `POST /api/workouts {pot_id}` | `{workout_id, period, reps_target, period_ends_at}`; `409` if the period is checked in or a check-in is in flight |
@@ -184,10 +226,15 @@ All JSON uses snake_case. Amounts are in USDC base units (6 decimals) as integer
 | `GET /healthz` | `ok` |
 
 ```
-Pot    = {id, title, creator, stake, reps_per_period, periods, period_seconds,
-          start_time, end_time, max_members, member_count,
-          status: "upcoming" | "active" | "ended", current_period: number | null}
-Member = {address, checked_in: number[], completed, out, claimed_amount: number | null}
+Pot       = {id, title, creator, stake, reps_per_period, periods, period_seconds,
+             start_time, end_time, max_members, member_count,
+             status: "upcoming" | "active" | "ended", current_period: number | null,
+             official: boolean, fee_bps: number}
+Member    = {address, checked_in: number[], completed, out, claimed_amount: number | null}
+Challenge = {pot: Pot,
+             template: {key, name, tagline,
+                        cadence: "daily" | "weekly" | "weekend" | "monthly" | "yearly",
+                        tier: "rookie" | "regular" | "beast"}}
 ```
 
 `start_time` and `end_time` are RFC 3339. A member is `out` once they've missed any finished
@@ -243,8 +290,10 @@ The server rejects a workout when any of these fail:
   8° of `min_elbow`, the body line never drops below 140°, and the elbow locks out (≥ 145°)
   between the bottom and the end.
 - **Recount.** The server recounts reps from `trace.elbow` with an independent hysteresis
-  counter (down ≤ 105°, up ≥ 145°, cycle ≥ 400 ms). The result must reach `reps_target` and be
-  at least the number of reported reps minus one.
+  counter (down ≤ 105°, up ≥ 145°, at least 250 ms below 145°). The result must reach
+  `reps_target` and be at least the number of reported reps minus one. The 250 ms is shorter
+  than the 400 ms rep minimum because the client may count from a lockout of up to 155°, so a
+  fast honest rep spends well under 400 ms below 145°.
 - **Synthetic signals.**
   - with 15+ reps, rep durations must not be near-identical (coefficient of variation < 3%);
   - with 5+ reps, the minimum elbow angles must not be (standard deviation < 1°);
@@ -377,6 +426,8 @@ Configuration is through environment variables:
 | `EXPLORER_URL` | |
 | `BIND_ADDR` | optional |
 | `WEB_DIR` | optional |
+| `CURATOR_ENABLED` | optional, default `true`; opens official challenges |
+| `FEE_COLLECTOR_ENABLED` | optional, default `true`; collects finished pots' fees |
 
 ## Testing
 

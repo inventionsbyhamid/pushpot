@@ -1,5 +1,6 @@
-//! Submits check-ins on behalf of the server. A single task owns the oracle key so transactions
-//! go out one at a time and nonces never race.
+//! Sends transactions from the oracle key: check-ins, official challenges (the oracle key is also
+//! the curator) and fee collection. A single task owns the key so transactions go out one at a
+//! time and nonces never race.
 
 use std::{
     future::Future,
@@ -8,15 +9,17 @@ use std::{
 };
 
 use alloy::{
-    contract::Error as ContractError,
+    contract::{Error as ContractError, SolCallBuilder},
     primitives::{Address, B256, U256},
     providers::{DynProvider, Provider, ProviderBuilder},
+    rpc::types::TransactionReceipt,
+    sol_types::{SolCall, SolEvent},
 };
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 use super::{
-    IPushPot::{self, IPushPotErrors},
+    IPushPot::{self, IPushPotErrors, PotParams},
     redact_url,
 };
 use crate::config::Config;
@@ -46,16 +49,28 @@ pub struct CheckInReceipt {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CreatedChallenge {
+    pub pot_id: u64,
+    pub tx_hash: B256,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectedFee {
+    pub amount: U256,
+    pub tx_hash: B256,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OracleError {
     /// The member is already checked in for this period, possibly by an earlier attempt whose
     /// receipt we never saw.
     #[error("already checked in for this period")]
     AlreadyCheckedIn,
-    /// The contract refused the check-in; retrying won't help.
+    /// The contract refused the transaction; retrying won't help.
     #[error("{0}")]
     Rejected(String),
-    /// RPC or network trouble; the check-in may succeed if retried.
+    /// RPC or network trouble; the transaction may succeed if retried, or may even have landed.
     #[error("{0}")]
     Unavailable(String),
 }
@@ -69,16 +84,59 @@ impl OracleError {
     }
 }
 
-pub type CheckInFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<CheckInReceipt, OracleError>> + Send + 'a>>;
+pub type OracleFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OracleError>> + Send + 'a>>;
 
-pub trait CheckInSender: Send + Sync {
-    fn check_in(&self, request: CheckInRequest) -> CheckInFuture<'_>;
+/// Transactions sent from the oracle key.
+pub trait OracleSender: Send + Sync {
+    fn check_in(&self, request: CheckInRequest) -> OracleFuture<'_, CheckInReceipt>;
+    /// Opens an official challenge and returns its pot id, read from the receipt.
+    fn create_challenge(&self, params: PotParams) -> OracleFuture<'_, CreatedChallenge>;
+    /// Sends a finished pot's fee to the treasury.
+    fn collect_fee(&self, pot_id: u64) -> OracleFuture<'_, CollectedFee>;
+}
+
+type Reply<T> = oneshot::Sender<Result<T, OracleError>>;
+
+enum Action {
+    CheckIn(CheckInRequest, Reply<CheckInReceipt>),
+    CreateChallenge(PotParams, Reply<CreatedChallenge>),
+    CollectFee(u64, Reply<CollectedFee>),
+}
+
+impl Action {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::CheckIn(..) => "check-in",
+            Self::CreateChallenge(..) => "create challenge",
+            Self::CollectFee(..) => "collect fee",
+        }
+    }
+
+    fn is_abandoned(&self) -> bool {
+        match self {
+            Self::CheckIn(_, reply) => reply.is_closed(),
+            Self::CreateChallenge(_, reply) => reply.is_closed(),
+            Self::CollectFee(_, reply) => reply.is_closed(),
+        }
+    }
+
+    fn fail(self, err: OracleError) {
+        match self {
+            Self::CheckIn(_, reply) => {
+                let _ = reply.send(Err(err));
+            }
+            Self::CreateChallenge(_, reply) => {
+                let _ = reply.send(Err(err));
+            }
+            Self::CollectFee(_, reply) => {
+                let _ = reply.send(Err(err));
+            }
+        }
+    }
 }
 
 struct Job {
-    request: CheckInRequest,
-    reply: oneshot::Sender<Result<CheckInReceipt, OracleError>>,
+    action: Action,
     queued_at: Instant,
 }
 
@@ -97,27 +155,23 @@ impl Oracle {
             .connect_http(config.rpc_url.clone())
             .erased();
         let (jobs, rx) = mpsc::channel(64);
-        tokio::spawn(worker(
-            provider,
-            config.contract,
-            config.rpc_url.clone(),
-            rx,
-        ));
+        let worker = Worker::new(provider, config.contract, config.rpc_url.clone());
+        tokio::spawn(worker.run(rx));
         Self { jobs }
     }
-}
 
-impl CheckInSender for Oracle {
-    fn check_in(&self, request: CheckInRequest) -> CheckInFuture<'_> {
+    fn enqueue<T: Send + 'static>(
+        &self,
+        action: impl FnOnce(Reply<T>) -> Action + Send + 'static,
+    ) -> OracleFuture<'_, T> {
         Box::pin(async move {
             let (reply, rx) = oneshot::channel();
-            let queued_at = Instant::now();
+            let job = Job {
+                action: action(reply),
+                queued_at: Instant::now(),
+            };
             self.jobs
-                .send(Job {
-                    request,
-                    reply,
-                    queued_at,
-                })
+                .send(job)
                 .await
                 .map_err(|_| OracleError::Unavailable("oracle is shutting down".into()))?;
             rx.await
@@ -126,98 +180,189 @@ impl CheckInSender for Oracle {
     }
 }
 
-async fn worker(
-    provider: DynProvider,
-    contract: Address,
-    rpc_url: Url,
-    mut jobs: mpsc::Receiver<Job>,
-) {
-    let pot = IPushPot::new(contract, provider.clone());
-    while let Some(job) = jobs.recv().await {
-        let request = &job.request;
-        if job.reply.is_closed() {
-            tracing::warn!(pot_id = request.pot_id, member = %request.member, "check-in abandoned");
-            continue;
-        }
-        if job.queued_at.elapsed() > MAX_QUEUE_WAIT {
-            tracing::warn!(pot_id = request.pot_id, member = %request.member, "check-in expired in queue");
-            let _ = job.reply.send(Err(OracleError::Unavailable(
-                "check-in queue is backed up".into(),
-            )));
-            continue;
-        }
+impl OracleSender for Oracle {
+    fn check_in(&self, request: CheckInRequest) -> OracleFuture<'_, CheckInReceipt> {
+        self.enqueue(|reply| Action::CheckIn(request, reply))
+    }
 
-        let result = submit(&provider, &pot, request)
-            .await
-            .map_err(|err| err.redacted(&rpc_url));
-        match &result {
-            Ok(receipt) => tracing::info!(
-                pot_id = request.pot_id,
-                member = %request.member,
-                period = request.period,
-                tx = %receipt.tx_hash,
-                latency_ms = receipt.latency_ms,
-                "check-in recorded"
-            ),
-            Err(err) => {
-                tracing::warn!(pot_id = request.pot_id, error = %err, "check-in failed")
-            }
-        }
-        let _ = job.reply.send(result);
+    fn create_challenge(&self, params: PotParams) -> OracleFuture<'_, CreatedChallenge> {
+        self.enqueue(|reply| Action::CreateChallenge(params, reply))
+    }
+
+    fn collect_fee(&self, pot_id: u64) -> OracleFuture<'_, CollectedFee> {
+        self.enqueue(move |reply| Action::CollectFee(pot_id, reply))
     }
 }
 
-async fn submit(
-    provider: &DynProvider,
-    pot: &IPushPot::IPushPotInstance<DynProvider>,
-    req: &CheckInRequest,
-) -> Result<CheckInReceipt, OracleError> {
-    let started = Instant::now();
-    let call = pot.checkIn(
-        U256::from(req.pot_id),
-        req.member,
-        req.period,
-        req.reps,
-        req.evidence,
-    );
+struct Worker {
+    provider: DynProvider,
+    pot: IPushPot::IPushPotInstance<DynProvider>,
+    rpc_url: Url,
+}
 
-    // Simulate first so contract rejections come back as readable errors instead of a mined revert.
-    call.call().await.map_err(classify)?;
-
-    let gas_price = provider.get_gas_price().await.map_err(unavailable)?;
-    let pending = call
-        .max_fee_per_gas((gas_price * 2).max(MIN_MAX_FEE))
-        .max_priority_fee_per_gas(PRIORITY_FEE)
-        .send()
-        .await
-        .map_err(classify)?;
-    let tx_hash = *pending.tx_hash();
-
-    let deadline = Instant::now() + RECEIPT_TIMEOUT;
-    loop {
-        if let Some(receipt) = provider
-            .get_transaction_receipt(tx_hash)
-            .await
-            .map_err(unavailable)?
-        {
-            if !receipt.status() {
-                return Err(OracleError::Rejected(
-                    "check-in transaction reverted".into(),
-                ));
-            }
-            return Ok(CheckInReceipt {
-                tx_hash,
-                block_number: receipt.block_number.unwrap_or_default(),
-                latency_ms: started.elapsed().as_millis() as u64,
-            });
+impl Worker {
+    fn new(provider: DynProvider, contract: Address, rpc_url: Url) -> Self {
+        let pot = IPushPot::new(contract, provider.clone());
+        Self {
+            provider,
+            pot,
+            rpc_url,
         }
-        if Instant::now() > deadline {
-            return Err(OracleError::Unavailable(format!(
-                "check-in {tx_hash} not confirmed yet"
-            )));
-        }
-        tokio::time::sleep(RECEIPT_POLL).await;
     }
+
+    async fn run(self, mut jobs: mpsc::Receiver<Job>) {
+        while let Some(Job { action, queued_at }) = jobs.recv().await {
+            if action.is_abandoned() {
+                tracing::warn!(job = action.kind(), "oracle job abandoned");
+                continue;
+            }
+            if queued_at.elapsed() > MAX_QUEUE_WAIT {
+                tracing::warn!(job = action.kind(), "oracle job expired in queue");
+                action.fail(OracleError::Unavailable(
+                    "the oracle queue is backed up".into(),
+                ));
+                continue;
+            }
+            match action {
+                Action::CheckIn(request, reply) => {
+                    let _ = reply.send(self.check_in(&request).await);
+                }
+                Action::CreateChallenge(params, reply) => {
+                    let _ = reply.send(self.create_challenge(params).await);
+                }
+                Action::CollectFee(pot_id, reply) => {
+                    let _ = reply.send(self.collect_fee(pot_id).await);
+                }
+            }
+        }
+    }
+
+    async fn check_in(&self, req: &CheckInRequest) -> Result<CheckInReceipt, OracleError> {
+        let started = Instant::now();
+        let call = self.pot.checkIn(
+            U256::from(req.pot_id),
+            req.member,
+            req.period,
+            req.reps,
+            req.evidence,
+        );
+        let receipt = match self.send(call).await {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                tracing::warn!(pot_id = req.pot_id, error = %err, "check-in failed");
+                return Err(err);
+            }
+        };
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            pot_id = req.pot_id,
+            member = %req.member,
+            period = req.period,
+            tx = %receipt.transaction_hash,
+            latency_ms,
+            cost_usdc = cost_usdc(&receipt),
+            "check-in recorded"
+        );
+        Ok(CheckInReceipt {
+            tx_hash: receipt.transaction_hash,
+            block_number: receipt.block_number.unwrap_or_default(),
+            latency_ms,
+        })
+    }
+
+    async fn create_challenge(&self, params: PotParams) -> Result<CreatedChallenge, OracleError> {
+        let title = params.title.clone();
+        let receipt = self.send(self.pot.createChallenge(params)).await?;
+        let tx_hash = receipt.transaction_hash;
+        let pot_id = event::<IPushPot::PotCreated>(&receipt, *self.pot.address())
+            .and_then(|created| u64::try_from(created.potId).ok())
+            .ok_or_else(|| {
+                OracleError::Unavailable(format!("{tx_hash} created no readable pot"))
+            })?;
+        tracing::info!(
+            pot_id,
+            %title,
+            tx = %tx_hash,
+            cost_usdc = cost_usdc(&receipt),
+            "challenge created"
+        );
+        Ok(CreatedChallenge { pot_id, tx_hash })
+    }
+
+    async fn collect_fee(&self, pot_id: u64) -> Result<CollectedFee, OracleError> {
+        let receipt = self.send(self.pot.collectFee(U256::from(pot_id))).await?;
+        let amount = event::<IPushPot::FeeCollected>(&receipt, *self.pot.address())
+            .map_or(U256::ZERO, |collected| collected.amount);
+        tracing::info!(
+            pot_id,
+            %amount,
+            tx = %receipt.transaction_hash,
+            cost_usdc = cost_usdc(&receipt),
+            "fee collected"
+        );
+        Ok(CollectedFee {
+            amount,
+            tx_hash: receipt.transaction_hash,
+        })
+    }
+
+    /// Simulates the call, sends it, and waits for a successful receipt.
+    async fn send<C: SolCall + Send + Sync>(
+        &self,
+        call: SolCallBuilder<&DynProvider, C>,
+    ) -> Result<TransactionReceipt, OracleError> {
+        let sent = async {
+            // Simulate first so contract rejections come back as readable errors instead of a
+            // mined revert.
+            call.call().await.map_err(classify)?;
+
+            let gas_price = self.provider.get_gas_price().await.map_err(unavailable)?;
+            let pending = call
+                .max_fee_per_gas((gas_price * 2).max(MIN_MAX_FEE))
+                .max_priority_fee_per_gas(PRIORITY_FEE)
+                .send()
+                .await
+                .map_err(classify)?;
+            let tx_hash = *pending.tx_hash();
+
+            let deadline = Instant::now() + RECEIPT_TIMEOUT;
+            loop {
+                if let Some(receipt) = self
+                    .provider
+                    .get_transaction_receipt(tx_hash)
+                    .await
+                    .map_err(unavailable)?
+                {
+                    if !receipt.status() {
+                        tracing::warn!(tx = %tx_hash, "transaction reverted");
+                        return Err(OracleError::Rejected("the transaction reverted".into()));
+                    }
+                    return Ok(receipt);
+                }
+                if Instant::now() > deadline {
+                    return Err(OracleError::Unavailable(format!(
+                        "{tx_hash} not confirmed yet"
+                    )));
+                }
+                tokio::time::sleep(RECEIPT_POLL).await;
+            }
+        };
+        sent.await.map_err(|err| err.redacted(&self.rpc_url))
+    }
+}
+
+/// The first `E` the contract emitted in this transaction.
+fn event<E: SolEvent>(receipt: &TransactionReceipt, contract: Address) -> Option<E> {
+    receipt
+        .logs()
+        .iter()
+        .filter(|log| log.address() == contract)
+        .find_map(|log| E::decode_log_data(log.data()).ok())
+}
+
+/// Gas is paid in native USDC, which has 18 decimals.
+fn cost_usdc(receipt: &TransactionReceipt) -> f64 {
+    receipt.gas_used as f64 * receipt.effective_gas_price as f64 / 1e18
 }
 
 fn classify(err: ContractError) -> OracleError {
@@ -230,8 +375,13 @@ fn classify(err: ContractError) -> OracleError {
         IPushPotErrors::NotMember(_) => "not a member of this pot",
         IPushPotErrors::NotEnoughReps(_) => "not enough reps for this pot",
         IPushPotErrors::PotNotFound(_) => "pot not found",
+        IPushPotErrors::InvalidParams(_) => "the contract refused these parameters",
+        IPushPotErrors::NotCurator(_) => "the oracle key isn't the curator",
+        IPushPotErrors::NotEnded(_) => "the pot hasn't ended",
+        IPushPotErrors::NothingToClaim(_) => "nothing to collect",
+        // A paused contract, or this pot's oracle was rotated or revoked.
         IPushPotErrors::Paused(_) | IPushPotErrors::NotOracle(_) => {
-            return OracleError::Unavailable("check-ins are temporarily unavailable".into());
+            return OracleError::Unavailable("the contract isn't accepting this right now".into());
         }
     };
     OracleError::Rejected(reason.into())
@@ -243,11 +393,19 @@ fn unavailable(err: impl std::fmt::Display) -> OracleError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::{providers::ProviderBuilder, transports::mock::Asserter};
+    use alloy::{
+        primitives::{LogData, U256},
+        providers::ProviderBuilder,
+        sol_types::SolEvent,
+        transports::mock::Asserter,
+    };
+    use serde_json::json;
 
     use super::*;
 
-    fn job(queued_at: Instant) -> (Job, oneshot::Receiver<Result<CheckInReceipt, OracleError>>) {
+    fn check_in(
+        queued_at: Instant,
+    ) -> (Job, oneshot::Receiver<Result<CheckInReceipt, OracleError>>) {
         let (reply, rx) = oneshot::channel();
         let request = CheckInRequest {
             pot_id: 1,
@@ -257,8 +415,7 @@ mod tests {
             evidence: B256::ZERO,
         };
         let job = Job {
-            request,
-            reply,
+            action: Action::CheckIn(request, reply),
             queued_at,
         };
         (job, rx)
@@ -273,13 +430,14 @@ mod tests {
             .connect_mocked_client(rpc.clone())
             .erased();
         let (jobs, rx) = mpsc::channel(4);
-        let url = "https://rpc.test".parse().unwrap();
-        let worker = tokio::spawn(worker(provider, Address::ZERO, url, rx));
+        let worker = Worker::new(provider, Address::ZERO, "https://rpc.test".parse().unwrap());
+        let worker = tokio::spawn(worker.run(rx));
 
-        let (abandoned, receiver) = job(Instant::now());
+        let (abandoned, receiver) = check_in(Instant::now());
         drop(receiver);
         jobs.send(abandoned).await.unwrap();
-        let (expired, receiver) = job(Instant::now() - MAX_QUEUE_WAIT - Duration::from_secs(1));
+        let (expired, receiver) =
+            check_in(Instant::now() - MAX_QUEUE_WAIT - Duration::from_secs(1));
         jobs.send(expired).await.unwrap();
 
         let result = receiver.await.unwrap();
@@ -290,5 +448,69 @@ mod tests {
         drop(jobs);
         worker.await.unwrap();
         assert_eq!(rpc.read_q().len(), 1);
+    }
+
+    fn receipt(logs: &[(Address, LogData)]) -> TransactionReceipt {
+        let logs: Vec<_> = logs
+            .iter()
+            .enumerate()
+            .map(|(i, (address, data))| {
+                json!({
+                    "address": address,
+                    "topics": data.topics(),
+                    "data": data.data,
+                    "blockHash": B256::repeat_byte(2),
+                    "blockNumber": "0x9",
+                    "transactionHash": B256::repeat_byte(1),
+                    "transactionIndex": "0x0",
+                    "logIndex": format!("{i:#x}"),
+                    "removed": false,
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "type": "0x2",
+            "status": "0x1",
+            "cumulativeGasUsed": "0x0",
+            "logs": logs,
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": B256::repeat_byte(1),
+            "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(2),
+            "blockNumber": "0x9",
+            "gasUsed": "0x30d40",
+            "effectiveGasPrice": "0x4a817c800",
+            "from": Address::repeat_byte(3),
+            "to": Address::repeat_byte(4),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reads_events_only_from_our_contract() {
+        let contract = Address::repeat_byte(0xcc);
+        let created = |pot_id: u64| {
+            IPushPot::PotCreated {
+                potId: U256::from(pot_id),
+                creator: Address::repeat_byte(0xaa),
+                title: "Daily 20 · Oct 14".into(),
+                stake: 1_000_000,
+                repsPerPeriod: 20,
+                periods: 1,
+                periodSeconds: 86_400,
+                startTime: 1_800_000_000,
+                maxMembers: 1_000,
+            }
+            .encode_log_data()
+        };
+        let receipt = receipt(&[
+            (Address::repeat_byte(0xee), created(666)),
+            (contract, created(42)),
+        ]);
+
+        let created = event::<IPushPot::PotCreated>(&receipt, contract).unwrap();
+        assert_eq!(created.potId, U256::from(42));
+        assert!(event::<IPushPot::FeeCollected>(&receipt, contract).is_none());
+        assert!((cost_usdc(&receipt) - 0.004).abs() < 1e-9);
     }
 }

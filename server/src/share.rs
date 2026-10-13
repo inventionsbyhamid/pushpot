@@ -28,15 +28,16 @@ pub fn describe(pot: &PotRow) -> (String, String) {
     let title = format!("Join “{}” on PushPot", pot.title);
     let cadence = if pot.period_seconds == 86_400 {
         format!(
-            "{} pushups a day for {} days",
-            pot.reps_per_period, pot.periods
+            "{} pushups a day for {}",
+            pot.reps_per_period,
+            count(pot.periods, "day")
         )
     } else {
         format!(
-            "{} pushups every {} for {} rounds",
+            "{} pushups every {} for {}",
             pot.reps_per_period,
             human_duration(pot.period_seconds),
-            pot.periods
+            count(pot.periods, "round")
         )
     };
     let members = match pot.member_count {
@@ -116,6 +117,14 @@ fn plural(n: i32, unit: &str) -> String {
     }
 }
 
+fn count(n: i32, unit: &str) -> String {
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -134,6 +143,8 @@ mod tests {
             start_time: Utc::now(),
             max_members: 10,
             member_count: 3,
+            official: false,
+            fee_bps: 0,
         }
     }
 
@@ -147,6 +158,14 @@ mod tests {
 
         let (_, description) = describe(&pot("Sprint", 600));
         assert!(description.starts_with("20 pushups every 10 min for 7 rounds"));
+
+        let mut daily = pot("Daily 20 · Oct 14", 86_400);
+        daily.periods = 1;
+        assert!(
+            describe(&daily)
+                .1
+                .starts_with("20 pushups a day for 1 day.")
+        );
     }
 
     #[test]

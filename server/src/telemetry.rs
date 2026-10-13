@@ -14,6 +14,9 @@ use uuid::Uuid;
 const DOWN_ANGLE: u8 = 105;
 const UP_ANGLE: u8 = 145;
 const MIN_REP_MS: f64 = 400.0;
+/// The recount times a rep from 145°, while the client may already count from its adapted
+/// lockout of up to 155°, so a fast honest rep spends well under `MIN_REP_MS` below 145°.
+const MIN_RECOUNT_MS: f64 = 250.0;
 const MAX_REP_MS: f64 = 8_000.0;
 const MIN_SWING: f64 = 45.0;
 const MIN_BODY_LINE: u8 = 140;
@@ -363,7 +366,7 @@ pub fn recount(elbow: &[u8], dt: &[u8]) -> u32 {
                 down = true;
             }
         } else if angle >= UP_ANGLE {
-            if left_top_at.is_some_and(|start| t - start >= MIN_REP_MS) {
+            if left_top_at.is_some_and(|start| t - start >= MIN_RECOUNT_MS) {
                 count += 1;
             }
             down = false;
@@ -421,11 +424,37 @@ pub mod fixtures {
         }
     }
 
-    /// Simulates `reps` pushups the way the browser records them: ~30 fps with frame-timing
-    /// jitter and `dt[0] == 0`, an elbow dipping from ~165° to `bottom` with a pause at the top,
-    /// a body line that sags a little on the way down, and noisy visibility. Rep summaries are
-    /// read off the trace like the client's counter does. With `jitter` off, the reps themselves
-    /// are machine-regular; sensor noise remains.
+    /// Simulated pushups, recorded the way the browser does it: ~30 fps with frame-timing jitter
+    /// and `dt[0] == 0`, an elbow dipping from `top` to `bottom` with a pause at the top, a body
+    /// line that sags a little on the way down, and noisy visibility. Rep summaries are read off
+    /// the trace like the client's counter does: a rep starts below `lockout` and ends on the
+    /// second frame back above it. With `jitter` off, the reps themselves are machine-regular;
+    /// sensor noise remains.
+    pub struct Pushups {
+        pub reps: usize,
+        /// One rep, top to top.
+        pub rep_ms: f64,
+        pub top: f64,
+        pub bottom: f64,
+        pub lockout: f64,
+        pub body: u8,
+        pub jitter: bool,
+    }
+
+    impl Default for Pushups {
+        fn default() -> Self {
+            Self {
+                reps: 10,
+                rep_ms: 1_200.0,
+                top: TOP,
+                bottom: 82.0,
+                lockout: 150.0,
+                body: 165,
+                jitter: true,
+            }
+        }
+    }
+
     pub fn session(
         workout_id: Uuid,
         reps: usize,
@@ -434,80 +463,103 @@ pub mod fixtures {
         body: u8,
         jitter: bool,
     ) -> Telemetry {
-        let mut rng = Lcg(42);
-        let human = |rng: &mut Lcg, scale: f64| if jitter { rng.noise(scale) } else { 0.0 };
-
-        let mut cycles = Vec::with_capacity(reps);
-        let mut t = 300.0;
-        for _ in 0..reps {
-            let length = rep_ms * (1.0 + human(&mut rng, 0.2));
-            let depth = bottom + human(&mut rng, 6.0);
-            cycles.push((t, length, depth));
-            t += length + 300.0 + human(&mut rng, 300.0);
+        Pushups {
+            reps,
+            rep_ms,
+            bottom,
+            body,
+            jitter,
+            ..Pushups::default()
         }
-        let end = t;
+        .record(workout_id)
+    }
 
-        let (mut dt, mut elbow, mut body_line, mut vis, mut times) =
-            (vec![], vec![], vec![], vec![], vec![]);
-        let mut t = 0.0;
-        while t <= end {
-            let step = if dt.is_empty() {
-                0.0
-            } else {
-                (33.0 + rng.noise(6.0)).round()
-            };
-            t += step;
-            let rep = cycles
+    impl Pushups {
+        pub fn record(&self, workout_id: Uuid) -> Telemetry {
+            let mut rng = Lcg(42);
+            let jitter = self.jitter;
+            let human = |rng: &mut Lcg, scale: f64| if jitter { rng.noise(scale) } else { 0.0 };
+
+            let mut cycles = Vec::with_capacity(self.reps);
+            let mut t = 300.0;
+            for _ in 0..self.reps {
+                let length = self.rep_ms * (1.0 + human(&mut rng, 0.2));
+                let depth = self.bottom + human(&mut rng, 6.0);
+                cycles.push((t, length, depth));
+                t += length + 300.0 + human(&mut rng, 300.0);
+            }
+            let end = t;
+
+            let (mut dt, mut elbow, mut body_line, mut vis, mut times) =
+                (vec![], vec![], vec![], vec![], vec![]);
+            let mut t = 0.0;
+            while t <= end {
+                let step = if dt.is_empty() {
+                    0.0
+                } else {
+                    (33.0 + rng.noise(6.0)).round()
+                };
+                t += step;
+                let rep = cycles
+                    .iter()
+                    .find(|&&(start, length, _)| (start..start + length).contains(&t));
+                let (angle, sag) = rep.map_or((self.top, 0.0), |&(start, length, depth)| {
+                    let phase = (t - start) / length;
+                    let mid = (self.top + depth) / 2.0;
+                    (
+                        mid + (self.top - mid) * (TAU * phase).cos(),
+                        3.0 * (PI * phase).sin(),
+                    )
+                });
+                dt.push(step as u8);
+                times.push(t);
+                elbow.push(degrees(angle + rng.noise(3.0)));
+                body_line.push(degrees(f64::from(self.body) - sag + rng.noise(3.0)));
+                vis.push((225.0 + rng.noise(20.0)).round() as u8);
+            }
+
+            let below = |i: usize| f64::from(elbow[i]) < self.lockout;
+            let summaries = cycles
                 .iter()
-                .find(|&&(start, length, _)| (start..start + length).contains(&t));
-            let (angle, sag) = rep.map_or((TOP, 0.0), |&(start, length, depth)| {
-                let phase = (t - start) / length;
-                let mid = (TOP + depth) / 2.0;
-                (
-                    mid + (TOP - mid) * (TAU * phase).cos(),
-                    3.0 * (PI * phase).sin(),
-                )
-            });
-            dt.push(step as u8);
-            times.push(t);
-            elbow.push(degrees(angle + rng.noise(3.0)));
-            body_line.push(degrees(f64::from(body) - sag + rng.noise(3.0)));
-            vis.push((225.0 + rng.noise(20.0)).round() as u8);
-        }
+                .map(|&(start, _, _)| {
+                    let first = (0..times.len())
+                        .find(|&i| times[i] >= start && below(i))
+                        .unwrap();
+                    let lowest = (first..times.len())
+                        .take_while(|&i| below(i))
+                        .min_by_key(|&i| elbow[i])
+                        .unwrap();
+                    let last = (lowest + 1..times.len())
+                        .find(|&i| !below(i - 1) && !below(i))
+                        .unwrap();
+                    let frames = first..=last;
+                    let mean_vis = frames.clone().map(|i| f64::from(vis[i])).sum::<f64>()
+                        / frames.clone().count() as f64
+                        / 255.0;
+                    Rep {
+                        start: times[first],
+                        bottom: times[lowest],
+                        end: times[last],
+                        min_elbow: f64::from(elbow[lowest]),
+                        max_elbow: f64::from(frames.clone().map(|i| elbow[i]).max().unwrap()),
+                        min_body: f64::from(frames.map(|i| body_line[i]).min().unwrap()),
+                        vis: (mean_vis * 100.0).round() / 100.0,
+                    }
+                })
+                .collect();
 
-        let summaries = cycles
-            .iter()
-            .map(|&(start, length, _)| {
-                let frames: Vec<usize> = (0..times.len())
-                    .filter(|&i| (start..=start + length).contains(&times[i]))
-                    .collect();
-                let lowest = *frames.iter().min_by_key(|&&i| elbow[i]).unwrap();
-                let mean_vis = frames.iter().map(|&i| f64::from(vis[i])).sum::<f64>()
-                    / frames.len() as f64
-                    / 255.0;
-                Rep {
-                    start: times[frames[0]],
-                    bottom: times[lowest],
-                    end: times[*frames.last().unwrap()],
-                    min_elbow: f64::from(elbow[lowest]),
-                    max_elbow: f64::from(frames.iter().map(|&i| elbow[i]).max().unwrap()),
-                    min_body: f64::from(frames.iter().map(|&i| body_line[i]).min().unwrap()),
-                    vis: (mean_vis * 100.0).round() / 100.0,
-                }
-            })
-            .collect();
-
-        Telemetry {
-            v: 1,
-            workout_id,
-            duration_ms: t,
-            reps: summaries,
-            trace: Trace {
-                dt: STANDARD.encode(&dt),
-                elbow: STANDARD.encode(&elbow),
-                body: STANDARD.encode(&body_line),
-                vis: STANDARD.encode(&vis),
-            },
+            Telemetry {
+                v: 1,
+                workout_id,
+                duration_ms: t,
+                reps: summaries,
+                trace: Trace {
+                    dt: STANDARD.encode(&dt),
+                    elbow: STANDARD.encode(&elbow),
+                    body: STANDARD.encode(&body_line),
+                    vis: STANDARD.encode(&vis),
+                },
+            }
         }
     }
 
@@ -625,6 +677,49 @@ mod tests {
             let result = validate(&s.telemetry, &ctx(&s, reps as u32));
             assert!(result.is_ok(), "{reps} × {rep_ms} ms: {result:?}");
         }
+    }
+
+    #[test]
+    fn counts_fast_reps_after_the_client_lockout_adapted_to_155() {
+        // From a 167° top the client raises its lockout to 155°. Its 600 ms reps still last
+        // over 400 ms from that lockout, but some spend under 400 ms below the recount's 145°.
+        let workout_id = Uuid::new_v4();
+        let telemetry = fixtures::Pushups {
+            reps: 12,
+            rep_ms: 600.0,
+            top: 167.0,
+            bottom: 85.0,
+            lockout: 155.0,
+            ..Default::default()
+        }
+        .record(workout_id);
+
+        let trace = decode_trace(&telemetry.trace).unwrap();
+        let times = trace.times();
+        let below_145 = |rep: &Rep| -> f64 {
+            times
+                .iter()
+                .zip(&trace.elbow)
+                .zip(&trace.dt)
+                .filter(|&((&t, &deg), _)| (rep.start..=rep.end).contains(&t) && deg < UP_ANGLE)
+                .map(|(_, &dt)| f64::from(dt))
+                .sum()
+        };
+        assert!(
+            telemetry
+                .reps
+                .iter()
+                .all(|rep| rep.end - rep.start >= MIN_REP_MS)
+        );
+        assert!(telemetry.reps.iter().any(|rep| below_145(rep) < MIN_REP_MS));
+
+        let context = Context {
+            workout_id,
+            reps_target: 12,
+            server_elapsed_ms: telemetry.duration_ms,
+        };
+        let verdict = validate(&telemetry, &context).unwrap();
+        assert_eq!(verdict.recount, 12);
     }
 
     #[test]

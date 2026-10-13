@@ -37,6 +37,8 @@ pub struct PotRow {
     pub start_time: DateTime<Utc>,
     pub max_members: i32,
     pub member_count: i64,
+    pub official: bool,
+    pub fee_bps: i32,
 }
 
 impl PotRow {
@@ -49,17 +51,23 @@ impl PotRow {
     }
 }
 
+/// The columns `PotRow` reads, then any `$extra` columns, from `pots p` followed by `$rest`.
 macro_rules! select_pots {
     ($rest:literal) => {
+        select_pots!("", $rest)
+    };
+    ($extra:literal, $rest:literal) => {
         concat!(
             "select p.id, p.title, p.creator, p.stake, p.reps_per_period, p.periods,
-                    p.period_seconds, p.start_time, p.max_members,
-                    (select count(*) from members m where m.pot_id = p.id and m.active) as member_count
-             from pots p ",
+                    p.period_seconds, p.start_time, p.max_members, p.official, p.fee_bps,
+                    (select count(*) from members m where m.pot_id = p.id and m.active) as member_count",
+            $extra,
+            " from pots p ",
             $rest
         )
     };
 }
+pub(super) use select_pots;
 
 #[derive(Serialize)]
 pub struct PotView {
@@ -76,10 +84,12 @@ pub struct PotView {
     member_count: i64,
     status: Status,
     current_period: Option<i32>,
+    official: bool,
+    fee_bps: i32,
 }
 
 impl PotView {
-    fn new(row: PotRow, now: DateTime<Utc>) -> Self {
+    pub(super) fn new(row: PotRow, now: DateTime<Utc>) -> Self {
         let schedule = row.schedule();
         Self {
             id: row.id,
@@ -95,6 +105,8 @@ impl PotView {
             member_count: row.member_count,
             status: schedule.status(now),
             current_period: schedule.current_period(now),
+            official: row.official,
+            fee_bps: row.fee_bps,
         }
     }
 }

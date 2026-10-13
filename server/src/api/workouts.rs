@@ -27,7 +27,7 @@ use crate::{
 };
 
 const MAX_TELEMETRY_BYTES: usize = 512 * 1024;
-const IN_FLIGHT: &str = "this check-in is already being recorded";
+const IN_FLIGHT: &str = "this check in is already being recorded";
 const ALREADY_CHECKED_IN: &str = "you've already checked in for this period";
 
 pub fn router() -> Router<AppState> {

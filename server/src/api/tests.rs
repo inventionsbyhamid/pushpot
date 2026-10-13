@@ -803,3 +803,72 @@ async fn event_streams_need_a_pot_and_a_free_slot(db: PgPool) {
     drop(first);
     assert_eq!(open_events(&app, 1).await.status(), StatusCode::OK);
 }
+
+/// An official daily challenge (pot `id`) that started `started` ago, opened from `template`.
+async fn seed_challenge(db: &PgPool, id: i64, template: &str, started: &str) {
+    sqlx::query(
+        "insert into pots (id, creator, title, stake, reps_per_period, periods, period_seconds,
+             start_time, max_members, created_tx, created_block, official, fee_bps)
+         values ($1, '0xc0', 'Daily 20', 1000000, 20, 1, 86400, now() - $2::interval, 1000, '0x',
+             1, true, 500)",
+    )
+    .bind(id)
+    .bind(started)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into challenges (template_key, start_time, title, state, from_block, pot_id)
+         select $2, start_time, title, 'created', 1, id from pots where id = $1",
+    )
+    .bind(id)
+    .bind(template)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn lists_challenges_that_have_not_ended(db: PgPool) {
+    seed_pot(&db, 1, &[ALICE]).await;
+    seed_challenge(&db, 10, "daily-20", "1 hour").await;
+    seed_challenge(&db, 11, "kickoff", "-1 day").await;
+    seed_challenge(&db, 12, "daily-50", "3 days").await;
+    seed_challenge(&db, 13, "retired-template", "1 hour").await;
+    let app = app(db.clone(), Arc::default());
+
+    let (status, body, _) = Call::get("/api/challenges").send(&app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let challenges = body["challenges"].as_array().unwrap();
+    let ids: Vec<i64> = challenges
+        .iter()
+        .map(|c| c["pot"]["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [10, 11]);
+    assert_eq!(
+        challenges[0]["template"],
+        json!({
+            "key": "daily-20",
+            "cadence": "daily",
+            "name": "Daily 20",
+            "tier": "rookie",
+            "tagline": crate::challenges::template("daily-20").unwrap().tagline,
+        })
+    );
+    assert_eq!(challenges[0]["pot"]["status"], "active");
+    assert_eq!(challenges[1]["template"]["cadence"], "weekly");
+    assert_eq!(challenges[1]["pot"]["status"], "upcoming");
+
+    let (status, detail, _) = Call::get("/api/pots/10").send(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["pot"]["official"], true);
+    assert_eq!(detail["pot"]["fee_bps"], 500);
+    let (_, private, _) = Call::get("/api/pots/1").send(&app).await;
+    assert_eq!(private["pot"]["official"], false);
+    assert_eq!(private["pot"]["fee_bps"], 0);
+
+    // Served from the cache for a few seconds.
+    seed_challenge(&db, 14, "daily-100", "2 hours").await;
+    let (_, again, _) = Call::get("/api/challenges").send(&app).await;
+    assert_eq!(again, body);
+}

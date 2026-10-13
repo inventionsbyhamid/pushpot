@@ -20,15 +20,15 @@ pub struct Message {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SiweError {
-    #[error("malformed sign-in message: {0}")]
+    #[error("malformed sign in message: {0}")]
     Malformed(&'static str),
-    #[error("sign-in message is for a different site")]
+    #[error("sign in message is for a different site")]
     WrongDomain,
-    #[error("sign-in message is for a different network")]
+    #[error("sign in message is for a different network")]
     WrongChain,
-    #[error("sign-in message has expired")]
+    #[error("sign in message has expired")]
     Expired,
-    #[error("sign-in message is not valid yet")]
+    #[error("sign in message is not valid yet")]
     NotYetValid,
 }
 

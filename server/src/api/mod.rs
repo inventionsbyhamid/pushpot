@@ -1,3 +1,4 @@
+pub mod challenges;
 pub mod pots;
 pub mod workouts;
 
@@ -22,6 +23,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .merge(auth::router())
         .merge(pots::router())
+        .merge(challenges::router())
         .merge(workouts::router())
         .route("/api/{*rest}", any(|| async { AppError::NotFound }))
         .route("/p/{id}", get(share::pot_page))

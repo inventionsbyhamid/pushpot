@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use alloy::{
+    contract::Error as ContractError,
     primitives::U256,
     providers::Provider,
     rpc::types::{Filter, Log},
@@ -14,14 +15,14 @@ use anyhow::{Context, Result};
 use chrono::DateTime;
 use sqlx::{Connection, PgConnection, PgPool};
 
-use super::{IPushPot::IPushPotEvents, redact_url};
+use super::{Chain, IPushPot::IPushPotEvents, redact_url};
 use crate::{
     auth::format_address,
     state::{AppState, PotEvent, PotEventKind},
 };
 
 /// RPC providers cap `eth_getLogs` at 10,000 blocks per query.
-const MAX_RANGE: u64 = 9_999;
+pub const MAX_RANGE: u64 = 9_999;
 /// Consecutive failed ticks (2 s apart) after which the indexer is reported as stuck.
 const STUCK_AFTER: u32 = 15;
 
@@ -100,7 +101,7 @@ async fn tick(state: &AppState, cursor: u64) -> Result<(u64, bool)> {
         .context("get logs")?;
 
     let mut tx = state.db.begin().await?;
-    let events = apply_logs(&mut tx, &logs).await?;
+    let events = apply_logs(&mut tx, &state.chain, &logs).await?;
     sqlx::query(
         "insert into indexer_state (id, last_block) values (true, $1)
          on conflict (id) do update set last_block = excluded.last_block",
@@ -119,11 +120,15 @@ async fn tick(state: &AppState, cursor: u64) -> Result<(u64, bool)> {
 /// Applies a batch of logs and returns the events to broadcast. A log that can never be stored,
 /// such as one with data an older deployment let through, is reported and skipped: retrying it
 /// forever would stall every join and check-in behind it.
-pub async fn apply_logs(db: &mut PgConnection, logs: &[Log]) -> Result<Vec<PotEvent>> {
+pub async fn apply_logs(
+    db: &mut PgConnection,
+    chain: &Chain,
+    logs: &[Log],
+) -> Result<Vec<PotEvent>> {
     let mut events = Vec::new();
     for log in logs {
         let mut savepoint = db.begin().await?;
-        match apply(&mut savepoint, log).await {
+        match apply(&mut savepoint, chain, log).await {
             Ok(event) => {
                 savepoint.commit().await?;
                 events.extend(event);
@@ -146,8 +151,11 @@ pub async fn apply_logs(db: &mut PgConnection, logs: &[Log]) -> Result<Vec<PotEv
 
 /// Whether applying the log again would fail the same way: it couldn't be decoded or converted,
 /// or Postgres rejected the data itself (SQLSTATE class 22) or a constraint (class 23). Anything
-/// else, like a dropped connection, fails the batch so it is retried.
+/// else, like a dropped connection or an RPC error, fails the batch so it is retried.
 fn is_permanent(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<ContractError>().is_some() {
+        return false;
+    }
     match err.downcast_ref::<sqlx::Error>() {
         Some(sqlx::Error::Database(db)) => db
             .code()
@@ -158,7 +166,7 @@ fn is_permanent(err: &anyhow::Error) -> bool {
 }
 
 /// Applies one log and returns the event to broadcast, if any.
-async fn apply(db: &mut PgConnection, log: &Log) -> Result<Option<PotEvent>> {
+async fn apply(db: &mut PgConnection, chain: &Chain, log: &Log) -> Result<Option<PotEvent>> {
     let decoded = match IPushPotEvents::decode_log(&log.inner) {
         Ok(decoded) => decoded,
         Err(err) if is_mirrored(log) => return Err(err).context("decoding log"),
@@ -180,14 +188,16 @@ async fn apply(db: &mut PgConnection, log: &Log) -> Result<Option<PotEvent>> {
 
     Ok(match decoded.data {
         IPushPotEvents::PotCreated(e) => {
+            let id = pot_id(e.potId)?;
             let start = DateTime::from_timestamp(e.startTime as i64, 0).context("start time")?;
+            let fee_bps = chain.fee_bps(id as u64).await?;
             sqlx::query(
                 "insert into pots (id, creator, title, stake, reps_per_period, periods,
-                     period_seconds, start_time, max_members, created_tx, created_block)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     period_seconds, start_time, max_members, created_tx, created_block, fee_bps)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  on conflict (id) do nothing",
             )
-            .bind(pot_id(e.potId)?)
+            .bind(id)
             .bind(format_address(e.creator))
             .bind(sanitize_title(&e.title))
             .bind(i64::try_from(e.stake).context("stake")?)
@@ -198,8 +208,25 @@ async fn apply(db: &mut PgConnection, log: &Log) -> Result<Option<PotEvent>> {
             .bind(i32::from(e.maxMembers))
             .bind(&tx_hash)
             .bind(block)
+            .bind(i32::from(fee_bps))
             .execute(&mut *db)
             .await?;
+            None
+        }
+        IPushPotEvents::ChallengeCreated(e) => {
+            sqlx::query("update pots set official = true where id = $1")
+                .bind(pot_id(e.potId)?)
+                .execute(&mut *db)
+                .await?;
+            None
+        }
+        IPushPotEvents::FeeCollected(e) => {
+            sqlx::query("update pots set fee_amount = $2, fee_tx = $3 where id = $1")
+                .bind(pot_id(e.potId)?)
+                .bind(i64::try_from(e.amount).context("fee amount")?)
+                .bind(&tx_hash)
+                .execute(&mut *db)
+                .await?;
             None
         }
         IPushPotEvents::Joined(e) => {
@@ -316,12 +343,34 @@ mod tests {
     use std::sync::Arc;
 
     use alloy::{
-        primitives::{Address, B256, Log as PrimitiveLog, LogData},
-        sol_types::SolEvent,
+        primitives::{Address, B256, Bytes, Log as PrimitiveLog, LogData},
+        sol_types::{SolCall, SolEvent},
     };
 
     use super::*;
     use crate::{chain::IPushPot, testing};
+
+    /// `getPot`'s answer for a pot with this fee.
+    fn pot_on_chain(fee_bps: u16) -> Bytes {
+        let pot = IPushPot::Pot {
+            creator: Address::repeat_byte(0xaa),
+            startTime: 1_900_000_000,
+            periodSeconds: 600,
+            periods: 3,
+            repsPerPeriod: 10,
+            maxMembers: 5,
+            memberCount: 0,
+            completerCount: 0,
+            claimedCount: 0,
+            feeBps: fee_bps,
+            feeCollected: false,
+            official: false,
+            stake: 1_000_000,
+            paidOut: Default::default(),
+            oracle: Address::repeat_byte(0x0c),
+        };
+        IPushPot::getPotCall::abi_encode_returns(&pot).into()
+    }
 
     fn log(data: LogData) -> Log {
         Log {
@@ -368,8 +417,10 @@ mod tests {
             joined(1, member),
         ];
 
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        rpc.push_success(&pot_on_chain(0));
         let mut tx = db.begin().await.unwrap();
-        let events = apply_logs(&mut tx, &logs).await.unwrap();
+        let events = apply_logs(&mut tx, &state.chain, &logs).await.unwrap();
         tx.commit().await.unwrap();
 
         assert_eq!(events.len(), 1);
@@ -384,6 +435,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(members, 1);
+    }
+
+    #[sqlx::test]
+    async fn indexes_challenges_fees_and_collections(db: PgPool) {
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        let logs = [
+            created(2, "Daily 50 · Oct 14"),
+            log(IPushPot::ChallengeCreated {
+                potId: U256::from(2),
+            }
+            .encode_log_data()),
+            log(IPushPot::FeeCollected {
+                potId: U256::from(2),
+                treasury: Address::repeat_byte(0x7e),
+                amount: U256::from(150_000),
+            }
+            .encode_log_data()),
+        ];
+
+        rpc.push_success(&pot_on_chain(500));
+        let mut tx = db.begin().await.unwrap();
+        apply_logs(&mut tx, &state.chain, &logs).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let pot: (bool, i32, Option<i64>) =
+            sqlx::query_as("select official, fee_bps, fee_amount from pots where id = 2")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(pot, (true, 500, Some(150_000)));
+    }
+
+    #[sqlx::test]
+    async fn an_rpc_failure_retries_the_batch_instead_of_skipping(db: PgPool) {
+        let (state, _rpc) = testing::state(db.clone(), Arc::default());
+        let mut tx = db.begin().await.unwrap();
+        assert!(
+            apply_logs(&mut tx, &state.chain, &[created(3, "gm")])
+                .await
+                .is_err()
+        );
     }
 
     #[test]
