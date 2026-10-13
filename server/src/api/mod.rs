@@ -13,6 +13,7 @@ use crate::{
     auth,
     error::AppError,
     http::{require_same_origin, security_headers, static_files},
+    share,
     state::AppState,
 };
 
@@ -23,6 +24,7 @@ pub fn app(state: AppState) -> Router {
         .merge(pots::router())
         .merge(workouts::router())
         .route("/api/{*rest}", any(|| async { AppError::NotFound }))
+        .route("/p/{id}", get(share::pot_page))
         .layer(DefaultBodyLimit::max(64 * 1024));
 
     static_files(api, &state.config.web_dir)

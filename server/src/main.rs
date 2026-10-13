@@ -5,6 +5,7 @@ mod config;
 mod error;
 mod http;
 mod pots;
+mod share;
 mod state;
 mod telemetry;
 
@@ -58,6 +59,9 @@ async fn main() -> anyhow::Result<()> {
         oracle: Arc::new(Oracle::spawn(&config)),
         events,
         auth_limiter: Arc::new(RateLimiter::new(30, Duration::from_secs(60))),
+        index_html: std::fs::read_to_string(config.web_dir.join("index.html"))
+            .ok()
+            .map(Into::into),
     };
 
     tokio::spawn(chain::indexer::run(state.clone()));

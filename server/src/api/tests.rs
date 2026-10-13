@@ -88,6 +88,7 @@ fn app(db: PgPool, oracle: Arc<FakeOracle>) -> Router {
         oracle,
         events: broadcast::channel(16).0,
         auth_limiter: Arc::new(RateLimiter::new(100, Duration::from_secs(60))),
+        index_html: None,
     })
 }
 

@@ -14,6 +14,8 @@ pub struct AppState {
     pub oracle: Arc<dyn CheckInSender>,
     pub events: broadcast::Sender<PotEvent>,
     pub auth_limiter: Arc<RateLimiter>,
+    /// The built `index.html`, used to render link previews. `None` when the web app isn't built.
+    pub index_html: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
