@@ -7,3 +7,4 @@ server/target
 web/node_modules
 web/dist
 web/public/mediapipe
+wallets.json
