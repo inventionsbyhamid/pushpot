@@ -358,8 +358,8 @@ with the `pose_landmarker_lite` model.
 - *Down:* elbow ≤ 110° for two frames. A side-on camera reads the bottom a little shallow, so
   this is a chest close to the floor; the guide still coaches 90°.
 - *Up:* elbow ≥ 140° for two frames, adapting after three reps to 12° under the user's own
-  top, between 140° and 155°. The server checks against 5° to 10° looser limits, because one failed
-  rep rejects the whole workout.
+  top, between 140° and 155°. The server checks against 5° to 10° looser limits, because one
+  failed rep rejects the whole workout.
 - *A rep counts only if:*
   - the cycle is ≥ 500 ms;
   - ≥ 500 ms have passed since the last rep;
