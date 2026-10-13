@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+/target
+server/target
+web/node_modules
+web/dist
+web/public/mediapipe
