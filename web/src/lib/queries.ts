@@ -1,10 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { api, ApiError } from "./api";
-import type { Pot, PotDetail } from "./types";
+import type { Challenge, Pot, PotDetail } from "./types";
 
 export const potKeys = {
   lists: ["pots"] as const,
   mine: (viewer: string | null) => ["pots", "mine", viewer] as const,
+  challenges: ["pots", "challenges"] as const,
   detail: (id: number) => ["pot", id] as const,
 };
 
@@ -30,5 +31,14 @@ export function useMyPots(viewer: string | null, enabled: boolean) {
     queryKey: potKeys.mine(viewer),
     queryFn: async () => (await api.get<{ pots: Pot[] }>("/api/pots?scope=mine")).pots,
     enabled,
+  });
+}
+
+/** Open and running official challenges; refreshed so member counts and new cohorts show up. */
+export function useChallenges() {
+  return useQuery({
+    queryKey: potKeys.challenges,
+    queryFn: async () => (await api.get<{ challenges: Challenge[] }>("/api/challenges")).challenges,
+    refetchInterval: 60_000,
   });
 }

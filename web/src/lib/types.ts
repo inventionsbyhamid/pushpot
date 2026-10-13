@@ -14,6 +14,10 @@ export interface Pot {
   member_count: number;
   status: PotStatus;
   current_period: number | null;
+  /** Opened by the platform and joinable by anyone, rather than invite-only. */
+  official: boolean;
+  /** Platform fee on forfeited stakes, in basis points, fixed when the pot was created. */
+  fee_bps: number;
 }
 
 export interface Member {
@@ -27,6 +31,23 @@ export interface Member {
 export interface PotDetail {
   pot: Pot;
   members: Member[];
+}
+
+export type Cadence = "daily" | "weekly" | "weekend" | "monthly" | "yearly";
+
+export type Tier = "rookie" | "regular" | "beast";
+
+export interface ChallengeTemplate {
+  key: string;
+  cadence: Cadence;
+  name: string;
+  tier: Tier;
+  tagline: string;
+}
+
+export interface Challenge {
+  pot: Pot;
+  template: ChallengeTemplate;
 }
 
 export interface StartedWorkout {

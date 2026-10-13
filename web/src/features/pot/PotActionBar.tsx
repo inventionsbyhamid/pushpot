@@ -2,13 +2,13 @@ import { useConnectModal } from "@rainbow-me/rainbowkit";
 import { useEffect, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { useAccount, useReadContract } from "wagmi";
-import { Button } from "../../components/Button";
+import { Button, ButtonLink } from "../../components/Button";
 import { Spinner } from "../../components/Spinner";
 import { pushPotAbi } from "../../lib/abi";
 import { useAuth } from "../../lib/auth";
 import { chain, pushPotAddress } from "../../lib/config";
 import { formatDuration, formatUsdc } from "../../lib/format";
-import { isDaily, type MemberState, type PotClock } from "../../lib/pot";
+import { periodUnit, type MemberState, type PotClock } from "../../lib/pot";
 import type { Member, Pot } from "../../lib/types";
 import { ClaimSheet } from "./ClaimSheet";
 import { JoinSheet } from "./JoinSheet";
@@ -56,7 +56,8 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
     openConnectModal?.();
   };
 
-  const daily = isDaily(pot);
+  const unit = periodUnit(pot);
+  const current = unit === "day" ? "today" : `this ${unit}`;
   const timeUntil = (at: number | null) => formatDuration(((at ?? now) - now) / 1000);
   let content: ReactNode;
 
@@ -104,7 +105,19 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
         </Button>
       );
     } else if (!me) {
-      content = <Status title="Joining closed" detail="This pot already started. Cheer them on." />;
+      content = pot.official ? (
+        <Status
+          title="Joining closed"
+          detail="This challenge already started. Catch the next one."
+          action={
+            <ButtonLink to="/#challenges" variant="secondary" className="min-h-11 text-lg">
+              Challenges
+            </ButtonLink>
+          }
+        />
+      ) : (
+        <Status title="Joining closed" detail="This pot already started. Cheer them on." />
+      );
     } else if (meState === "out") {
       content = (
         <Status
@@ -115,11 +128,11 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
     } else if (meState === "done") {
       content = (
         <Status
-          title={daily ? "Done for today ✅" : "Done for this round ✅"}
+          title={`Done for ${current} ✅`}
           detail={
             lastPeriod
               ? `That was the last one. Claims open in ${timeUntil(clock.claimsOpenAt)}.`
-              : `Next ${daily ? "day" : "round"} starts in ${timeUntil(clock.periodEndsAt)}.`
+              : `Next ${unit} starts in ${timeUntil(clock.periodEndsAt)}.`
           }
         />
       );
@@ -127,10 +140,10 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
       content = (
         <>
           <p className="mb-2 text-center text-sm text-amber">
-            {daily ? "Today" : "This round"} ends in {timeUntil(clock.periodEndsAt)}
+            {unit === "day" ? "Today" : `This ${unit}`} ends in {timeUntil(clock.periodEndsAt)}
           </p>
           <Button className="min-h-14 w-full text-2xl" onClick={startWorkout}>
-            {daily ? "Do today's" : "Do this round's"} {pot.reps_per_period} pushups
+            Do {current}'s {pot.reps_per_period} pushups
           </Button>
         </>
       );

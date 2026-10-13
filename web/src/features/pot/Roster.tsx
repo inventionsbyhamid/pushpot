@@ -27,6 +27,12 @@ interface RosterProps {
 }
 
 export function Roster({ pot, members, clock, now, viewer }: RosterProps) {
+  // Official challenges are effectively uncapped, so only the head count matters there.
+  const count = !pot.official
+    ? `${pot.member_count} of ${pot.max_members}`
+    : pot.member_count > 1
+      ? `${pot.member_count} in`
+      : null;
   const ordered = [...members].sort(
     (a, b) => Number(sameAddress(b.address, viewer)) - Number(sameAddress(a.address, viewer)),
   );
@@ -37,12 +43,15 @@ export function Roster({ pot, members, clock, now, viewer }: RosterProps) {
         <h2 id="roster" className="font-display text-4xl font-extrabold">
           Roster
         </h2>
-        <p className="text-sm text-mute tabular-nums">
-          {pot.member_count} of {pot.max_members}
-        </p>
+        {count && <p className="text-sm text-mute tabular-nums">{count}</p>}
       </div>
 
-      <ul className="divide-y divide-line rounded-2xl border border-line bg-panel">
+      {members.length === 0 && (
+        <p className="rounded-2xl border border-dashed border-line px-4 py-5 text-mute">
+          {clock.phase === "upcoming" ? "Nobody's in yet. Be the first." : "Nobody joined."}
+        </p>
+      )}
+      <ul className="divide-y divide-line rounded-2xl border border-line bg-panel empty:hidden">
         {ordered.map((member) => {
           const you = sameAddress(member.address, viewer);
           const state = memberState(pot, member, clock, now);

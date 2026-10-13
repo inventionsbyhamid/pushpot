@@ -28,6 +28,11 @@ export function formatUsdcExact(value: bigint | number): string {
   return `${sign}${whole}.${fraction.padEnd(usdcDecimals, "0")} USDC`;
 }
 
+/** Basis points as a percentage: 500 → "5%", 250 → "2.5%". */
+export function formatBps(bps: number): string {
+  return `${(bps / 100).toLocaleString("en", { maximumFractionDigits: 2 })}%`;
+}
+
 export function shortAddress(address: string): string {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }

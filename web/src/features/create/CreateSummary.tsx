@@ -1,6 +1,7 @@
 import { DetailRow } from "../../components/DetailRow";
+import { FeeNote } from "../../components/FeeNote";
 import { formatDateTime, formatDuration, formatUsdc } from "../../lib/format";
-import { cadenceLabel, isDaily, lengthLabel } from "../../lib/pot";
+import { lengthLabel, periodUnit, planLabel } from "../../lib/pot";
 
 interface CreateSummaryProps {
   title: string;
@@ -10,6 +11,8 @@ interface CreateSummaryProps {
   stake: bigint;
   startsAt: number | null;
   maxMembers: number;
+  /** From the contract; undefined while loading. */
+  feeBps: number | undefined;
   now: number;
 }
 
@@ -21,6 +24,7 @@ export function CreateSummary({
   stake,
   startsAt,
   maxMembers,
+  feeBps,
   now,
 }: CreateSummaryProps) {
   const schedule = { reps_per_period: reps ?? 0, period_seconds: periodSeconds, periods };
@@ -37,11 +41,7 @@ export function CreateSummary({
         >
           {title || "Your pot"}
         </p>
-        <p className="text-mute">
-          {reps === null
-            ? lengthLabel(schedule)
-            : `${cadenceLabel(schedule)}, ${lengthLabel(schedule)}`}
-        </p>
+        <p className="text-mute">{reps === null ? lengthLabel(schedule) : planLabel(schedule)}</p>
       </div>
 
       <dl className="space-y-1.5 border-t border-dashed border-line px-4 py-3 text-sm">
@@ -64,9 +64,9 @@ export function CreateSummary({
           <span className="ml-2 text-2xl text-chalk [text-shadow:none]">USDC</span>
         </p>
         <p className="mt-2 text-sm text-mute">
-          Friends can join until it starts. Finish every {isDaily(schedule) ? "day" : "round"} to
-          split the pot.
+          Friends can join until it starts. Finish every {periodUnit(schedule)} to split the pot.
         </p>
+        <FeeNote feeBps={feeBps} className="mt-1" />
       </div>
     </section>
   );

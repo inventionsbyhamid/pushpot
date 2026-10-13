@@ -5,6 +5,8 @@ import type { Member, Pot } from "./types";
 export const GRACE_MS = 5 * 60 * 1000;
 
 const DAY_SECONDS = 86_400;
+const WEEK_SECONDS = 7 * DAY_SECONDS;
+const BPS = 10_000n;
 
 export type PotPhase = "upcoming" | "active" | "settling" | "ended";
 
@@ -65,12 +67,18 @@ export function memberState(pot: Pot, member: Member, clock: PotClock, now: numb
   return marks[clock.period ?? 0] === "done" ? "done" : "pending";
 }
 
-export function isDaily(pot: Pick<Pot, "period_seconds">): boolean {
-  return pot.period_seconds === DAY_SECONDS;
+export type PeriodUnit = "day" | "week" | "round";
+
+export function periodUnit(pot: Pick<Pot, "period_seconds">): PeriodUnit {
+  if (pot.period_seconds === DAY_SECONDS) return "day";
+  if (pot.period_seconds === WEEK_SECONDS) return "week";
+  return "round";
 }
 
+const periodNames: Record<PeriodUnit, string> = { day: "Day", week: "Week", round: "Round" };
+
 export function periodName(pot: Pick<Pot, "period_seconds">): string {
-  return isDaily(pot) ? "Day" : "Round";
+  return periodNames[periodUnit(pot)];
 }
 
 function periodLength(seconds: number): string {
@@ -79,16 +87,35 @@ function periodLength(seconds: number): string {
   return `${Math.round(seconds / 60)} min`;
 }
 
-/** "20 pushups a day" / "10 pushups every 10 min". */
-export function cadenceLabel(pot: Pick<Pot, "period_seconds" | "reps_per_period">): string {
-  const every = isDaily(pot) ? "a day" : `every ${periodLength(pot.period_seconds)}`;
+type Schedule = Pick<Pot, "period_seconds" | "reps_per_period" | "periods">;
+
+/** "20 pushups a day" / "100 pushups once a week" / "10 pushups every 10 min". */
+export function cadenceLabel(pot: Omit<Schedule, "periods">): string {
+  const unit = periodUnit(pot);
+  const every =
+    unit === "day"
+      ? "a day"
+      : unit === "week"
+        ? "once a week"
+        : `every ${periodLength(pot.period_seconds)}`;
   return `${pot.reps_per_period} pushups ${every}`;
 }
 
-/** "7 days" / "3 rounds". */
-export function lengthLabel(pot: Pick<Pot, "period_seconds" | "periods">): string {
-  const unit = isDaily(pot) ? "day" : "round";
-  return `${pot.periods} ${unit}${pot.periods === 1 ? "" : "s"}`;
+/** "7 days" / "52 weeks" / "3 rounds". */
+export function lengthLabel(pot: Omit<Schedule, "reps_per_period">): string {
+  return `${pot.periods} ${periodUnit(pot)}${pot.periods === 1 ? "" : "s"}`;
+}
+
+/**
+ * The whole commitment in plain words: "50 pushups today", "20 pushups a day for 7 days",
+ * "100 pushups once a week for 52 weeks". `live` marks a single-period pot that is running.
+ */
+export function planLabel(pot: Schedule, live = false): string {
+  if (pot.periods > 1) return `${cadenceLabel(pot)} for ${lengthLabel(pot)}`;
+  const unit = periodUnit(pot);
+  if (unit === "day" && live) return `${pot.reps_per_period} pushups today`;
+  const within = unit === "round" ? periodLength(pot.period_seconds) : `one ${unit}`;
+  return `${pot.reps_per_period} pushups in ${within}`;
 }
 
 export function potTotal(pot: Pick<Pot, "stake" | "member_count">): bigint {
@@ -105,14 +132,64 @@ export function sameAddress(a: string | null | undefined, b: string | null | und
   return !!a && !!b && a.toLowerCase() === b.toLowerCase();
 }
 
-/** Short schedule line for lists: "Starts in 3h 12m", "Day 3 of 7", "Ended". */
-export function scheduleLabel(pot: Pot, clock: PotClock, now: number): string {
+export interface PayoutEstimate {
+  /** Platform fee if exactly `finishers` members complete. */
+  fee: bigint;
+  /** Each finisher's payout, or null when nobody finishes and everyone is refunded. */
+  share: bigint | null;
+}
+
+/**
+ * Mirrors the contract's payout: the fee comes only out of forfeited stakes, and there is none
+ * when nobody finishes. The last claimer also takes the rounding remainder, so this can be a
+ * base unit short.
+ */
+export function estimatePayout(
+  pot: Pick<Pot, "stake" | "member_count" | "fee_bps">,
+  finishers: number,
+): PayoutEstimate {
+  if (finishers <= 0) return { fee: 0n, share: null };
+  const forfeited = BigInt(pot.stake) * BigInt(Math.max(0, pot.member_count - finishers));
+  const fee = (forfeited * BigInt(pot.fee_bps)) / BPS;
+  return { fee, share: (potTotal(pot) - fee) / BigInt(finishers) };
+}
+
+export interface Countdown {
+  label: string;
+  /** Seconds to go, or null once there's nothing left to wait for. */
+  seconds: number | null;
+}
+
+/**
+ * What the pot is waiting on: its start, the end of the running period, or claims opening.
+ * `joining` phrases the start as the joining deadline, which is the same moment.
+ */
+export function potCountdown(
+  pot: Pick<Pot, "period_seconds" | "periods">,
+  clock: PotClock,
+  now: number,
+  { joining = false } = {},
+): Countdown {
+  const until = (at: number) => Math.max(0, (at - now) / 1000);
   switch (clock.phase) {
     case "upcoming":
-      return `Starts in ${formatDuration((clock.startsAt - now) / 1000)}`;
+      return { label: joining ? "Joining closes in" : "Starts in", seconds: until(clock.startsAt) };
     case "active":
-      return `${periodName(pot)} ${(clock.period ?? 0) + 1} of ${pot.periods}`;
-    default:
-      return "Ended";
+      return {
+        label:
+          pot.periods === 1
+            ? "Ends in"
+            : `${periodName(pot)} ${(clock.period ?? 0) + 1} of ${pot.periods} · ends in`,
+        seconds: until(clock.periodEndsAt ?? clock.endsAt),
+      };
+    case "settling":
+      return { label: "Ended · claims open in", seconds: until(clock.claimsOpenAt) };
+    case "ended":
+      return { label: "Ended · claims open", seconds: null };
   }
+}
+
+/** "Starts in 3h 12m", "Day 3 of 7 · ends in 9h 3m", "Ended · claims open". */
+export function countdownText({ label, seconds }: Countdown): string {
+  return seconds === null ? label : `${label} ${formatDuration(seconds)}`;
 }

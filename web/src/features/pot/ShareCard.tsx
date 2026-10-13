@@ -35,9 +35,11 @@ export function ShareCard({ pot, inviting }: { pot: Pot; inviting: boolean }) {
         {inviting ? "Invite friends" : "Share"}
       </h2>
       <p className="mb-4 text-mute">
-        {inviting
-          ? "Anyone with the link can join until the pot starts."
-          : "Let people follow along."}
+        {!inviting
+          ? "Let people follow along."
+          : pot.official
+            ? "Anyone can join until it starts. Bring a friend."
+            : "Anyone with the link can join until the pot starts."}
       </p>
       <div className="flex gap-4 rounded-2xl border border-line bg-panel p-4">
         <div className="shrink-0 rounded-lg bg-chalk p-2 text-ink">

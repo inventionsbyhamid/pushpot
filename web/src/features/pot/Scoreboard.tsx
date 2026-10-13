@@ -1,6 +1,6 @@
 import { ScoreDigits } from "../../components/ScoreDigits";
-import { formatClock, formatUsdc, formatUsdcApprox } from "../../lib/format";
-import { periodName, potTotal, type PotClock } from "../../lib/pot";
+import { formatBps, formatClock, formatUsdc, formatUsdcApprox } from "../../lib/format";
+import { estimatePayout, periodUnit, potCountdown, potTotal, type PotClock } from "../../lib/pot";
 import type { Pot } from "../../lib/types";
 
 interface ScoreboardProps {
@@ -13,27 +13,13 @@ interface ScoreboardProps {
   viewerStillIn: boolean;
 }
 
-function countdown(pot: Pot, clock: PotClock): { label: string; at: number | null } {
-  switch (clock.phase) {
-    case "upcoming":
-      return { label: "Starts in", at: clock.startsAt };
-    case "active":
-      return {
-        label: `${periodName(pot)} ${(clock.period ?? 0) + 1} ends in`,
-        at: clock.periodEndsAt,
-      };
-    case "settling":
-      return { label: "Claims open in", at: clock.claimsOpenAt };
-    case "ended":
-      return { label: "Result", at: null };
-  }
-}
-
 export function Scoreboard({ pot, clock, now, stillIn, viewerStillIn }: ScoreboardProps) {
   const total = potTotal(pot);
-  const share = stillIn > 0 ? total / BigInt(stillIn) : null;
-  const timer = countdown(pot, clock);
+  const { fee, share } = estimatePayout(pot, stillIn);
+  const timer = potCountdown(pot, clock, now);
   const started = clock.phase !== "upcoming";
+  // Official challenges allow up to a thousand players, so the cap isn't worth showing.
+  const outOf = started ? pot.member_count : pot.official ? null : pot.max_members;
   const amount = formatUsdc(total, { symbol: false });
   // Scale the figure so it and its unit stay on one line, from "5.00" up to "2,500.00".
   const amountEm = [...amount].reduce((em, char) => em + (/\d/.test(char) ? 0.62 : 0.3), 1);
@@ -56,13 +42,9 @@ export function Scoreboard({ pot, clock, now, stillIn, viewerStillIn }: Scoreboa
 
       <div className="grid grid-cols-[1fr_auto] border-t-2 border-line">
         <div className="border-r-2 border-line px-4 py-3">
-          <p className="text-sm text-mute">{timer.label}</p>
+          <p className="text-sm text-mute">{timer.seconds === null ? "Result" : timer.label}</p>
           <p className="font-display text-[2.5rem] leading-none font-black">
-            {timer.at === null ? (
-              "Final"
-            ) : (
-              <ScoreDigits value={formatClock((timer.at - now) / 1000)} />
-            )}
+            {timer.seconds === null ? "Final" : <ScoreDigits value={formatClock(timer.seconds)} />}
           </p>
         </div>
         <div className="px-4 py-3 text-right">
@@ -71,24 +53,37 @@ export function Scoreboard({ pot, clock, now, stillIn, viewerStillIn }: Scoreboa
           </p>
           <p className="font-display text-[2.5rem] leading-none font-black tabular-nums">
             {started ? stillIn : pot.member_count}
-            <span className="text-2xl text-mute">
-              /{started ? pot.member_count : pot.max_members}
-            </span>
+            {outOf !== null && <span className="text-2xl text-mute">/{outOf}</span>}
           </p>
         </div>
       </div>
 
-      <div className="flex items-baseline justify-between gap-3 border-t-2 border-line bg-panel/80 px-4 py-3">
-        {share === null ? (
+      <div className="border-t-2 border-line bg-panel/80 px-4 py-3">
+        {pot.member_count === 0 ? (
+          // Official challenges open empty, since the platform doesn't stake.
+          <p className="text-sm">
+            {started
+              ? "Nobody joined this one."
+              : `Nobody's in yet. Finishers split the stakes of everyone who misses a ${periodUnit(pot)}.`}
+          </p>
+        ) : share === null ? (
           <p className="text-sm">Nobody finished, so everyone gets their stake back.</p>
         ) : (
           <>
-            <p className="text-sm text-mute">
-              {viewerStillIn ? "Your share if you finish" : "Each finisher gets"}
-            </p>
-            <p className="font-display text-2xl leading-none font-extrabold text-volt">
-              {formatUsdcApprox(share)}
-            </p>
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="text-sm text-mute">
+                {viewerStillIn ? "Your share if you finish" : "Each finisher gets"}
+              </p>
+              <p className="font-display text-2xl leading-none font-extrabold text-volt">
+                {formatUsdcApprox(share)}
+              </p>
+            </div>
+            {pot.fee_bps > 0 && (
+              <div className="mt-1.5 flex items-baseline justify-between gap-3 text-sm text-mute">
+                <p>{formatBps(pot.fee_bps)} of forfeits to PushPot</p>
+                <p className="tabular-nums">{formatUsdcApprox(fee)}</p>
+              </div>
+            )}
           </>
         )}
       </div>

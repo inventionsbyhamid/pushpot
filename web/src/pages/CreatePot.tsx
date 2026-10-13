@@ -5,6 +5,7 @@ import { useNavigate } from "react-router";
 import { useAccount, useReadContract } from "wagmi";
 import { Button } from "../components/Button";
 import { ChipGroup } from "../components/ChipGroup";
+import { FeeNote } from "../components/FeeNote";
 import { TxSheet } from "../components/TxSheet";
 import { CreateSummary } from "../features/create/CreateSummary";
 import { MemberStepper } from "../features/create/MemberStepper";
@@ -61,6 +62,13 @@ export default function CreatePot() {
     abi: pushPotAbi,
     functionName: "maxStake",
   });
+  // New pots lock in the contract's current fee.
+  const feeBps = useReadContract({
+    chainId: chain.id,
+    address: pushPotAddress,
+    abi: pushPotAbi,
+    functionName: "feeBps",
+  });
 
   const plan = plans[planId];
   const periodWord = planId === "sprint" ? "round" : "day";
@@ -107,6 +115,8 @@ export default function CreatePot() {
   };
 
   const confirm = async () => {
+    const shownFee = feeBps.data;
+    if (shownFee === undefined) return;
     const at = resolveStart(startId, customStart, Date.now());
     if (at === null || startError(at, Date.now())) {
       setSheetOpen(false);
@@ -124,6 +134,7 @@ export default function CreatePot() {
           startTime: BigInt(Math.floor(at / 1000)),
           maxMembers,
         },
+        shownFee,
         report,
       ),
     );
@@ -263,6 +274,7 @@ export default function CreatePot() {
           stake={stake}
           startsAt={errors.start ? null : startsAt}
           maxMembers={maxMembers}
+          feeBps={feeBps.data}
           now={now}
         />
 
@@ -279,17 +291,26 @@ export default function CreatePot() {
         open={sheetOpen}
         onClose={() => setSheetOpen(false)}
         title="Create pot"
-        amount={stake}
+        // Held back until the fee is known, so nobody signs without seeing it.
+        amount={feeBps.data === undefined ? undefined : stake}
         amountLabel="You stake"
         pays
         confirmLabel="Sign and create"
         flow={flow.state}
         onConfirm={confirm}
+        amountError={
+          feeBps.isError
+            ? "Couldn't read the platform fee from Arc. Close and try again."
+            : undefined
+        }
       >
-        <p className="text-sm text-mute">
-          You'll sign a permit that lets the PushPot contract take exactly this amount, then confirm
-          one transaction.
-        </p>
+        <div className="space-y-2">
+          <FeeNote feeBps={feeBps.data} />
+          <p className="text-sm text-mute">
+            You'll sign a permit that lets the PushPot contract take exactly this amount, then
+            confirm one transaction.
+          </p>
+        </div>
       </TxSheet>
     </div>
   );

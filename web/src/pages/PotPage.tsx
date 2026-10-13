@@ -1,30 +1,27 @@
 import { useParams } from "react-router";
 import { useAccount } from "wagmi";
 import { Button } from "../components/Button";
+import { OfficialBadge } from "../components/OfficialBadge";
 import { PageSpinner } from "../components/PageSpinner";
+import { PotCountdown } from "../components/PotCountdown";
 import { StatusBadge } from "../components/StatusBadge";
 import { ActivityFeed } from "../features/pot/ActivityFeed";
 import { PotActionBar } from "../features/pot/PotActionBar";
 import { Roster } from "../features/pot/Roster";
 import { Scoreboard } from "../features/pot/Scoreboard";
 import { ShareCard } from "../features/pot/ShareCard";
+import { usePosePrefetch } from "../features/workout/usePosePrefetch";
 import { useNow } from "../hooks/useNow";
 import { usePotEvents } from "../hooks/usePotEvents";
 import { ApiError } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, formatUsdc, shortAddress } from "../lib/format";
-import {
-  cadenceLabel,
-  lengthLabel,
-  memberState,
-  parsePotId,
-  potClock,
-  sameAddress,
-} from "../lib/pot";
+import { memberState, parsePotId, planLabel, potClock, sameAddress } from "../lib/pot";
 import { usePot } from "../lib/queries";
 import NotFound from "./NotFound";
 
 export default function PotPage() {
+  usePosePrefetch();
   const potId = parsePotId(useParams().id);
   const { address } = useAccount();
   const query = usePot(potId);
@@ -64,24 +61,34 @@ export default function PotPage() {
   return (
     <div className="pb-40">
       <header className="pt-6 pb-5">
-        <div className="flex items-start justify-between gap-3">
-          <h1 className="min-w-0 font-display text-5xl leading-[0.95] font-black break-words">
-            {pot.title}
-          </h1>
-          <div className="pt-1.5">
-            <StatusBadge phase={clock.phase} />
-          </div>
+        <h1 className="font-display text-5xl leading-[0.95] font-black break-words">{pot.title}</h1>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <StatusBadge phase={clock.phase} />
+          {pot.official && <OfficialBadge />}
+          {pot.member_count > 1 && (
+            <span className="inline-flex h-7 items-center rounded-full border border-line px-2.5 text-sm font-semibold tabular-nums">
+              {pot.member_count} in
+            </span>
+          )}
         </div>
-        <p className="mt-2 text-lg">
-          {cadenceLabel(pot)} for {lengthLabel(pot)}.{" "}
+        <p className="mt-3 text-lg">
+          {planLabel(pot, clock.phase === "active")}.{" "}
           <span className="text-mute">{formatUsdc(pot.stake)} to play.</span>
         </p>
+        <PotCountdown pot={pot} clock={clock} now={now} className="mt-1" />
         <p className="mt-1 text-sm text-mute">
-          {formatDateTime(clock.startsAt)} to {formatDateTime(clock.endsAt)}. Started by{" "}
-          <span className="font-mono">
-            {sameAddress(pot.creator, address) ? "you" : shortAddress(pot.creator)}
-          </span>
-          .
+          {formatDateTime(clock.startsAt)} to {formatDateTime(clock.endsAt)}.{" "}
+          {pot.official ? (
+            "Run by PushPot."
+          ) : (
+            <>
+              Started by{" "}
+              <span className="font-mono">
+                {sameAddress(pot.creator, address) ? "you" : shortAddress(pot.creator)}
+              </span>
+              .
+            </>
+          )}
         </p>
       </header>
 

@@ -1,6 +1,8 @@
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Button, ButtonLink } from "../components/Button";
 import { PotList } from "../components/PotList";
+import { ChallengeHub } from "../features/challenges/ChallengeHub";
+import { usePosePrefetch } from "../features/workout/usePosePrefetch";
 import { useAuth } from "../lib/auth";
 import { describeError } from "../lib/errors";
 import { useMyPots } from "../lib/queries";
@@ -8,7 +10,7 @@ import { useMyPots } from "../lib/queries";
 const steps = [
   {
     title: "Stake",
-    body: "Start a pot and invite your friends with a link. Everyone puts in the same amount of USDC before it starts.",
+    body: "Join an official challenge, or start a pot and invite your friends with a link. Everyone puts in the same amount of USDC before it starts.",
   },
   {
     title: "Do your reps",
@@ -16,14 +18,16 @@ const steps = [
   },
   {
     title: "Split the pot",
-    body: "Finish every day and you share the stakes of everyone who didn't. If nobody finishes, everyone gets their money back.",
+    body: "Finish every day and you share the stakes of everyone who didn't, minus a small fee for PushPot. If everyone finishes, or nobody does, everyone gets their money back.",
   },
 ];
 
 export default function Home() {
+  usePosePrefetch();
   const auth = useAuth();
   const signedIn = auth.status === "authenticated";
   const mine = useMyPots(auth.address, signedIn);
+  const joined = useMemo(() => new Set(mine.data?.map((pot) => pot.id)), [mine.data]);
 
   return (
     <>
@@ -32,8 +36,8 @@ export default function Home() {
           Stake USDC on your pushups.
         </h1>
         <p className="mt-5 max-w-[34ch] text-lg text-chalk/85">
-          Put money in a pot with friends and do your reps on camera every day. Miss a day and your
-          stake goes to the people who didn't.
+          Join a challenge or start one with friends, then do your reps on camera. Miss a day and
+          your stake goes to the people who didn't.
         </p>
         <div className="mt-8 grid gap-3">
           <ButtonLink to="/practice" className="min-h-14 text-2xl">
@@ -47,6 +51,8 @@ export default function Home() {
           Trying it needs only your camera. No wallet, no money.
         </p>
       </section>
+
+      <ChallengeHub joined={joined} />
 
       {signedIn && (
         <PotSection title="Your pots" query={mine} empty="You're not in any pots yet." />

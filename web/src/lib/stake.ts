@@ -91,6 +91,8 @@ export interface JoinTerms {
   periodSeconds: number;
   /** Unix seconds. */
   startTime: number;
+  /** Platform fee on forfeited stakes, in basis points. */
+  feeBps: number;
 }
 
 async function ensureFunds(owner: Address, stake: bigint): Promise<void> {
@@ -146,11 +148,25 @@ function potLogs(receipt: TransactionReceipt) {
   return receipt.logs.filter((log) => isAddressEqual(log.address, pushPotAddress));
 }
 
+function readFeeBps(): Promise<number> {
+  return readContract(wagmiConfig, {
+    chainId: chain.id,
+    address: pushPotAddress,
+    abi: pushPotAbi,
+    functionName: "feeBps",
+  });
+}
+
+/** A new pot takes the contract's current fee, so it must still be the one the user reviewed. */
 export async function createPot(
   params: NewPotParams,
+  feeBps: number,
   report: ReportStep,
 ): Promise<TxOutcome & { potId: bigint }> {
   const owner = connectedOnArc();
+  if ((await readFeeBps()) !== feeBps) {
+    throw new Error("PushPot's fee changed since you loaded this page. Reload and review it.");
+  }
   await ensureFunds(owner, params.stake);
 
   report("sign");
@@ -180,7 +196,11 @@ export async function createPot(
  * Every term the user reviewed is re-read from the contract and must match before anything is
  * signed, so a stale or tampered API response can't misstate what they're joining.
  */
-export async function joinPot(potId: bigint, terms: JoinTerms, report: ReportStep): Promise<TxOutcome> {
+export async function joinPot(
+  potId: bigint,
+  terms: JoinTerms,
+  report: ReportStep,
+): Promise<TxOutcome> {
   const owner = connectedOnArc();
   const pot = await readPot(potId);
   const matches =
@@ -188,9 +208,12 @@ export async function joinPot(potId: bigint, terms: JoinTerms, report: ReportSte
     pot.repsPerPeriod === terms.repsPerPeriod &&
     pot.periods === terms.periods &&
     pot.periodSeconds === terms.periodSeconds &&
-    pot.startTime === BigInt(terms.startTime);
+    pot.startTime === BigInt(terms.startTime) &&
+    pot.feeBps === terms.feeBps;
   if (!matches) {
-    throw new Error("This pot's on-chain terms differ from what's shown. Reload the page and review them.");
+    throw new Error(
+      "This pot's on-chain terms differ from what's shown. Reload the page and review them.",
+    );
   }
   const stake = pot.stake;
   await ensureFunds(owner, stake);

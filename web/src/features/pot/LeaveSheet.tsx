@@ -4,7 +4,7 @@ import { useTxFlow } from "../../hooks/useTxFlow";
 import { potKeys } from "../../lib/queries";
 import { leavePot } from "../../lib/stake";
 import type { Pot } from "../../lib/types";
-import { usePotStake } from "./usePotStake";
+import { useChainPot } from "./useChainPot";
 
 interface LeaveSheetProps {
   pot: Pot;
@@ -15,11 +15,14 @@ interface LeaveSheetProps {
 export function LeaveSheet({ pot, open, onClose }: LeaveSheetProps) {
   const queryClient = useQueryClient();
   const flow = useTxFlow();
-  const stake = usePotStake(pot.id, open);
+  const chainPot = useChainPot(pot.id, open);
 
   const confirm = async () => {
     const result = await flow.run((report) => leavePot(BigInt(pot.id), report));
-    if (result) void queryClient.invalidateQueries({ queryKey: potKeys.detail(pot.id) });
+    if (!result) return;
+    void queryClient.invalidateQueries({ queryKey: potKeys.detail(pot.id) });
+    // Member counts in "Your pots" and the challenge list change too.
+    void queryClient.invalidateQueries({ queryKey: potKeys.lists });
   };
 
   return (
@@ -30,14 +33,14 @@ export function LeaveSheet({ pot, open, onClose }: LeaveSheetProps) {
         flow.reset();
       }}
       title="Leave pot"
-      amount={stake.data}
+      amount={chainPot.data?.stake}
       amountLabel="You get back"
       pays={false}
       confirmLabel="Leave and get refund"
       flow={flow.state}
       onConfirm={confirm}
       amountError={
-        stake.isError ? "Couldn't read the stake from Arc. Close and try again." : undefined
+        chainPot.isError ? "Couldn't read the stake from Arc. Close and try again." : undefined
       }
     />
   );
