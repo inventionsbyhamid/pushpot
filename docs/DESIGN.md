@@ -124,10 +124,18 @@ everything the indexer needs.
 
 **Indexer.** The indexer is the single writer for on-chain state.
 
-- It polls `eth_getLogs` for the contract about once per second, in ranges of at most 9,999
-  blocks (the RPC caps a query at 10k).
-- It stays one block behind the head: behind a load balancer, the node answering `eth_getLogs`
-  may not have the block another node reported as the head yet.
+- It keeps RPC use low because free endpoints are rate limited. A WebSocket subscription to the
+  contract's logs (`ARC_WS_URL`, derived from `ARC_RPC_URL` by default) announces activity as it
+  lands. The indexer then reads the logs with `eth_getLogs` up to the announced block, so the
+  announcement only wakes it and can never skip or reorder a log.
+- If the node answering `eth_getLogs` hasn't seen an announced log yet, the cursor stays put and
+  the read is retried shortly.
+- A safety poll runs every 60 seconds while the subscription is live (`INDEXER_IDLE_MS`) and
+  every 5 seconds while it's down (`INDEXER_INTERVAL_MS`). Idle, that is about 2,900 RPC calls
+  a day instead of one or two per block.
+- Reads cover at most 9,999 blocks (the RPC caps a query at 10k). The safety poll stays one
+  block behind the head: behind a load balancer, the node answering `eth_getLogs` may not have
+  the block another node reported as the head yet.
 - Each batch is applied in one database transaction together with the `last_block` cursor, so
   every log is applied exactly once.
 - A log that can never be stored (undecodable, or data Postgres rejects) is logged and skipped
@@ -185,7 +193,7 @@ cohort anyone can join without an invite. Every instance starts at 00:00 UTC and
 | `thirty-day` | 30 Day Challenge | regular | 25 a day | the whole month | 5 USDC | the 1st | next 1 |
 | `club-52` | 52 Week Club | beast | 100 a week | 52 weeks | 10 USDC | first Monday of each month | next 1 |
 
-- The scheduler runs at startup and every 10 minutes, when `CURATOR_ENABLED` is on and the
+- The scheduler runs at startup and every 30 minutes, when `CURATOR_ENABLED` is on and the
   contract's `curator` is the oracle key.
 - Only starts more than an hour and less than 30 days away (the contract's `MAX_START_DELAY`)
   are opened. A template staked above the contract's `maxStake` is skipped with a warning.
@@ -201,7 +209,7 @@ cohort anyone can join without an invite. Every instance starts at 00:00 UTC and
   instance twice.
 
 **Fees.** Each pot keeps the fee rate it was created with, taken only from forfeited stakes.
-When `FEE_COLLECTOR_ENABLED` is on, every 10 minutes the server looks for pots that stopped
+When `FEE_COLLECTOR_ENABLED` is on, every 30 minutes the server looks for pots that stopped
 accepting check-ins (end plus grace), have a fee rate, and have no fee on record. For each it
 reads `collectableFee`: if it's positive, it sends `collectFee` through the oracle task,
 otherwise it records 0. `collectFee` only ever pays the treasury, so anyone may call it.
@@ -419,13 +427,15 @@ Configuration is through environment variables:
 | `DATABASE_URL` | |
 | `PUBLIC_ORIGIN` | |
 | `ARC_RPC_URL` | |
+| `ARC_WS_URL` | optional; defaults to the WebSocket twin of `ARC_RPC_URL`, `off` to poll only |
 | `ARC_CHAIN_ID` | |
 | `PUSHPOT_ADDRESS` | |
 | `PUSHPOT_DEPLOY_BLOCK` | |
 | `ORACLE_PRIVATE_KEY` | |
-| `EXPLORER_URL` | |
 | `BIND_ADDR` | optional |
 | `WEB_DIR` | optional |
+| `INDEXER_INTERVAL_MS` | optional, default `5000`; poll interval while the subscription is down |
+| `INDEXER_IDLE_MS` | optional, default `60000`; safety poll while it's live |
 | `CURATOR_ENABLED` | optional, default `true`; opens official challenges |
 | `FEE_COLLECTOR_ENABLED` | optional, default `true`; collects finished pots' fees |
 

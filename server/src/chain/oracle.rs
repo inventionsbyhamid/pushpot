@@ -28,7 +28,11 @@ use crate::config::Config;
 const MIN_MAX_FEE: u128 = 20_000_000_000;
 const PRIORITY_FEE: u128 = 1_000_000_000;
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
-const RECEIPT_POLL: Duration = Duration::from_millis(150);
+/// Arc confirms in under a second, so the first look waits a little and later ones are spaced out.
+const FIRST_RECEIPT_CHECK: Duration = Duration::from_millis(400);
+const RECEIPT_POLL: Duration = Duration::from_millis(250);
+/// Arc's base fee sits at its floor almost always, so a recent reading is good enough.
+const GAS_PRICE_TTL: Duration = Duration::from_secs(60);
 /// Jobs that waited longer than this are failed instead of sent, so a backlog drains quickly and
 /// members can retry rather than wait on check-ins nobody is waiting for any more.
 const MAX_QUEUE_WAIT: Duration = Duration::from_secs(30);
@@ -198,6 +202,7 @@ struct Worker {
     provider: DynProvider,
     pot: IPushPot::IPushPotInstance<DynProvider>,
     rpc_url: Url,
+    gas_price: std::sync::Mutex<Option<(u128, Instant)>>,
 }
 
 impl Worker {
@@ -207,7 +212,18 @@ impl Worker {
             provider,
             pot,
             rpc_url,
+            gas_price: std::sync::Mutex::default(),
         }
+    }
+
+    async fn gas_price(&self) -> Result<u128, OracleError> {
+        let cached = *self.gas_price.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((price, _)) = cached.filter(|(_, at)| at.elapsed() < GAS_PRICE_TTL) {
+            return Ok(price);
+        }
+        let price = self.provider.get_gas_price().await.map_err(unavailable)?;
+        *self.gas_price.lock().unwrap_or_else(|e| e.into_inner()) = Some((price, Instant::now()));
+        Ok(price)
     }
 
     async fn run(self, mut jobs: mpsc::Receiver<Job>) {
@@ -316,7 +332,7 @@ impl Worker {
             // mined revert.
             call.call().await.map_err(classify)?;
 
-            let gas_price = self.provider.get_gas_price().await.map_err(unavailable)?;
+            let gas_price = self.gas_price().await?;
             let pending = call
                 .max_fee_per_gas((gas_price * 2).max(MIN_MAX_FEE))
                 .max_priority_fee_per_gas(PRIORITY_FEE)
@@ -326,6 +342,7 @@ impl Worker {
             let tx_hash = *pending.tx_hash();
 
             let deadline = Instant::now() + RECEIPT_TIMEOUT;
+            tokio::time::sleep(FIRST_RECEIPT_CHECK).await;
             loop {
                 if let Some(receipt) = self
                     .provider

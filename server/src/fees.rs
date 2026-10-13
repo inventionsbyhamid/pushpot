@@ -8,7 +8,7 @@ use sqlx::PgPool;
 
 use crate::{chain::redact_url, pots::GRACE, state::AppState};
 
-const INTERVAL: Duration = Duration::from_secs(600);
+const INTERVAL: Duration = Duration::from_secs(30 * 60);
 const BATCH: i64 = 20;
 
 pub async fn run(state: AppState) {

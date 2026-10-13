@@ -24,7 +24,7 @@ use crate::{
     state::AppState,
 };
 
-const INTERVAL: Duration = Duration::from_secs(600);
+const INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Too close to the start for anyone to find and join.
 const MIN_LEAD: TimeDelta = TimeDelta::hours(1);
 /// Mirrors `PushPot.MAX_START_DELAY`.

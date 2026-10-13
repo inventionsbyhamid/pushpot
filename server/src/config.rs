@@ -10,12 +10,17 @@ pub struct Config {
     pub database_url: String,
     pub public_origin: Url,
     pub rpc_url: Url,
+    /// Event subscription that wakes the indexer; `None` falls back to polling.
+    pub ws_url: Option<Url>,
     pub chain_id: u64,
     pub contract: Address,
     pub deploy_block: u64,
     pub oracle_signer: PrivateKeySigner,
     pub web_dir: PathBuf,
+    /// Poll interval while no event subscription is live.
     pub indexer_interval: Duration,
+    /// Safety poll while the subscription is live, to catch anything it missed.
+    pub indexer_idle_interval: Duration,
     /// Opens the official challenges in the catalog. Off for test deployments.
     pub curator_enabled: bool,
     /// Sends finished pots' fees to the treasury.
@@ -31,15 +36,23 @@ impl Config {
             bail!("PUBLIC_ORIGIN must be a bare origin like https://pushpot.example");
         }
 
+        let rpc_url: Url = optional("ARC_RPC_URL", "https://rpc.mainnet.arc.io")
+            .parse()
+            .context("ARC_RPC_URL")?;
+        let ws_url = match env::var("ARC_WS_URL").ok().as_deref().map(str::trim) {
+            Some("" | "off") => None,
+            Some(url) => Some(url.parse().context("ARC_WS_URL")?),
+            None => websocket_twin(&rpc_url),
+        };
+
         Ok(Self {
             bind_addr: optional("BIND_ADDR", "0.0.0.0:8080")
                 .parse()
                 .context("BIND_ADDR")?,
             database_url: required("DATABASE_URL")?,
             public_origin,
-            rpc_url: optional("ARC_RPC_URL", "https://rpc.mainnet.arc.io")
-                .parse()
-                .context("ARC_RPC_URL")?,
+            rpc_url,
+            ws_url,
             chain_id: optional("ARC_CHAIN_ID", "5042")
                 .parse()
                 .context("ARC_CHAIN_ID")?,
@@ -53,11 +66,8 @@ impl Config {
                 .parse()
                 .context("ORACLE_PRIVATE_KEY is not a valid private key")?,
             web_dir: optional("WEB_DIR", "../web/dist").into(),
-            indexer_interval: Duration::from_millis(
-                optional("INDEXER_INTERVAL_MS", "1000")
-                    .parse()
-                    .context("INDEXER_INTERVAL_MS")?,
-            ),
+            indexer_interval: millis("INDEXER_INTERVAL_MS", "5000")?,
+            indexer_idle_interval: millis("INDEXER_IDLE_MS", "60000")?,
             curator_enabled: flag("CURATOR_ENABLED", true)?,
             fee_collector_enabled: flag("FEE_COLLECTOR_ENABLED", true)?,
         })
@@ -89,6 +99,23 @@ fn required(key: &str) -> Result<String> {
 
 fn optional(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+fn millis(key: &str, default: &str) -> Result<Duration> {
+    let ms = optional(key, default).parse().context(key.to_owned())?;
+    Ok(Duration::from_millis(ms))
+}
+
+/// Most providers serve WebSockets on the same host and path as HTTP.
+fn websocket_twin(rpc_url: &Url) -> Option<Url> {
+    let scheme = match rpc_url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => return None,
+    };
+    let mut url = rpc_url.clone();
+    url.set_scheme(scheme).ok()?;
+    Some(url)
 }
 
 fn flag(key: &str, default: bool) -> Result<bool> {

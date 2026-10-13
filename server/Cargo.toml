@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-alloy = { version = "2.5", features = ["provider-http", "signer-local", "sol-types", "contract", "rpc-types", "network"] }
+alloy = { version = "2.5", features = ["provider-http", "signer-local", "sol-types", "contract", "rpc-types", "network", "provider-ws", "pubsub"] }
 anyhow = "1.0.104"
 axum = { version = "0.8", features = ["macros"] }
 axum-extra = { version = "0.12.6", features = ["cookie"] }

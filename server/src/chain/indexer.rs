@@ -1,19 +1,33 @@
 //! Mirrors PushPot events into Postgres. It is the only writer for on-chain state: each batch of
 //! logs is applied in the same transaction that advances the block cursor, so every log is
 //! applied exactly once and in order. Arc has deterministic finality, so there are no reorgs.
+//!
+//! To keep RPC use low it doesn't poll every block. A WebSocket subscription announces our
+//! contract's logs as they land, and the indexer then reads them with `eth_getLogs` as usual; the
+//! announcement is only a wake up call, so it can't skip or reorder anything. A slow safety poll
+//! covers whatever the subscription misses, and polling speeds up while it's down.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use alloy::{
     contract::Error as ContractError,
-    primitives::U256,
-    providers::Provider,
+    primitives::{Address, B256, U256},
+    providers::{Provider, ProviderBuilder, WsConnect},
     rpc::types::{Filter, Log},
     sol_types::SolEventInterface,
 };
 use anyhow::{Context, Result};
 use chrono::DateTime;
+use futures_util::StreamExt;
 use sqlx::{Connection, PgConnection, PgPool};
+use tokio::sync::mpsc;
+use url::Url;
 
 use super::{Chain, IPushPot::IPushPotEvents, redact_url};
 use crate::{
@@ -25,6 +39,37 @@ use crate::{
 pub const MAX_RANGE: u64 = 9_999;
 /// Consecutive failed ticks (2 s apart) after which the indexer is reported as stuck.
 const STUCK_AFTER: u32 = 15;
+/// Logs announced together (one block often has several) are read in one query.
+const BATCH_WINDOW: Duration = Duration::from_millis(200);
+/// How long to wait for the node answering `eth_getLogs` to catch up with an announcement, and
+/// how many times, before falling back to the regular poll.
+const LAG_RETRY: Duration = Duration::from_millis(300);
+const LAG_RETRIES: u32 = 20;
+
+/// A log the subscription announced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Announced {
+    block: u64,
+    tx: B256,
+    index: u64,
+}
+
+enum Wake {
+    Log(Announced),
+    /// The subscription (re)connected, so logs may have landed unannounced.
+    Resync,
+}
+
+/// What a pass over the chain achieved.
+#[derive(Debug, PartialEq, Eq)]
+enum Pass {
+    /// Indexed everything it set out to.
+    Done,
+    /// Stopped at the `eth_getLogs` range limit; run again straight away.
+    More,
+    /// The node answering hasn't seen an announced log yet; nothing was applied.
+    Lagging,
+}
 
 pub async fn run(state: AppState) {
     let mut cursor = match load_cursor(&state.db, state.chain.deploy_block).await {
@@ -34,19 +79,55 @@ pub async fn run(state: AppState) {
             return;
         }
     };
+    let live = Arc::new(AtomicBool::new(false));
+    let (wake_tx, mut wakes) = mpsc::channel(256);
+    match state.config.ws_url.clone() {
+        Some(url) => {
+            tokio::spawn(watch(url, state.chain.contract, wake_tx, live.clone()));
+        }
+        None => drop(wake_tx),
+    }
     tracing::info!(cursor, "indexer started");
 
+    let mut announced: Vec<Announced> = Vec::new();
     let mut failures = 0u32;
+    let mut lagging = 0u32;
     loop {
-        match tick(&state, cursor).await {
-            Ok((next, caught_up)) => {
+        let result = if announced.is_empty() {
+            tick(&state, cursor).await
+        } else {
+            catch_up(&state, cursor, &announced).await
+        };
+        match result {
+            Ok((next, pass)) => {
                 if failures >= STUCK_AFTER {
                     tracing::info!(cursor = next, failures, "indexer recovered");
                 }
                 failures = 0;
                 cursor = next;
-                if caught_up {
-                    tokio::time::sleep(state.config.indexer_interval).await;
+                announced.retain(|log| log.block > cursor);
+                match pass {
+                    Pass::More => {}
+                    Pass::Lagging if lagging < LAG_RETRIES => {
+                        lagging += 1;
+                        tokio::time::sleep(LAG_RETRY).await;
+                    }
+                    Pass::Lagging => {
+                        tracing::warn!(cursor, "announced logs never showed up; polling instead");
+                        lagging = 0;
+                        announced.clear();
+                    }
+                    Pass::Done => {
+                        lagging = 0;
+                        if announced.is_empty() {
+                            let interval = if live.load(Ordering::Relaxed) {
+                                state.config.indexer_idle_interval
+                            } else {
+                                state.config.indexer_interval
+                            };
+                            wait(&mut wakes, &mut announced, interval).await;
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -68,6 +149,86 @@ pub async fn run(state: AppState) {
     }
 }
 
+/// Sleeps until the subscription announces a log or `interval` passes.
+async fn wait(
+    wakes: &mut mpsc::Receiver<Wake>,
+    announced: &mut Vec<Announced>,
+    interval: Duration,
+) {
+    let wake = tokio::select! {
+        wake = wakes.recv() => wake,
+        () = tokio::time::sleep(interval) => return,
+    };
+    match wake {
+        // No subscription: plain polling.
+        None => tokio::time::sleep(interval).await,
+        Some(Wake::Resync) => {}
+        Some(Wake::Log(log)) => {
+            announced.push(log);
+            tokio::time::sleep(BATCH_WINDOW).await;
+            while let Ok(wake) = wakes.try_recv() {
+                if let Wake::Log(log) = wake {
+                    announced.push(log);
+                }
+            }
+        }
+    }
+}
+
+/// Keeps a log subscription open, reconnecting with backoff, and forwards each announcement.
+async fn watch(url: Url, contract: Address, wakes: mpsc::Sender<Wake>, live: Arc<AtomicBool>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match ProviderBuilder::new()
+            .connect_ws(WsConnect::new(url.as_str()))
+            .await
+        {
+            Ok(provider) => match provider
+                .subscribe_logs(&Filter::new().address(contract))
+                .await
+            {
+                Ok(subscription) => {
+                    live.store(true, Ordering::Relaxed);
+                    backoff = Duration::from_secs(1);
+                    tracing::info!("listening for contract events");
+                    if wakes.send(Wake::Resync).await.is_err() {
+                        return;
+                    }
+                    let mut logs = subscription.into_stream();
+                    while let Some(log) = logs.next().await {
+                        let (Some(block), Some(tx), Some(index)) =
+                            (log.block_number, log.transaction_hash, log.log_index)
+                        else {
+                            continue;
+                        };
+                        if wakes
+                            .send(Wake::Log(Announced { block, tx, index }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    live.store(false, Ordering::Relaxed);
+                    tracing::warn!(
+                        "contract event subscription ended; polling until it reconnects"
+                    );
+                }
+                Err(err) => {
+                    let error = redact_url(&err.to_string(), &url);
+                    tracing::warn!(%error, "could not subscribe to contract events");
+                }
+            },
+            Err(err) => {
+                let error = redact_url(&err.to_string(), &url);
+                tracing::warn!(%error, "could not open the event subscription");
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
 async fn load_cursor(db: &PgPool, deploy_block: u64) -> Result<u64> {
     let stored: Option<i64> = sqlx::query_scalar("select last_block from indexer_state")
         .fetch_optional(db)
@@ -75,7 +236,7 @@ async fn load_cursor(db: &PgPool, deploy_block: u64) -> Result<u64> {
     Ok(stored.map_or(deploy_block.saturating_sub(1), |b| b as u64))
 }
 
-async fn tick(state: &AppState, cursor: u64) -> Result<(u64, bool)> {
+async fn tick(state: &AppState, cursor: u64) -> Result<(u64, Pass)> {
     // Behind a load balancer, the node answering `eth_getLogs` may be a block behind the one
     // that reported the head, and an empty answer for that block would never be revisited.
     let head = state
@@ -86,22 +247,55 @@ async fn tick(state: &AppState, cursor: u64) -> Result<(u64, bool)> {
         .context("block number")?
         .saturating_sub(1);
     if head <= cursor {
-        return Ok((cursor, true));
+        return Ok((cursor, Pass::Done));
     }
     let to = head.min(cursor + MAX_RANGE);
+    let logs = get_logs(state, cursor + 1, to).await?;
+    commit(state, &logs, to).await?;
+    Ok((to, if to == head { Pass::Done } else { Pass::More }))
+}
+
+/// Reads up to the newest announced block. The announcement proves those blocks exist, so no head
+/// lookup is needed, but every announced log must be in the answer before the cursor moves.
+async fn catch_up(state: &AppState, cursor: u64, announced: &[Announced]) -> Result<(u64, Pass)> {
+    let Some(target) = announced
+        .iter()
+        .map(|log| log.block)
+        .max()
+        .filter(|&b| b > cursor)
+    else {
+        return Ok((cursor, Pass::Done));
+    };
+    let to = target.min(cursor + MAX_RANGE);
+    let logs = get_logs(state, cursor + 1, to).await?;
+    let present = |a: &Announced| {
+        logs.iter()
+            .any(|log| log.transaction_hash == Some(a.tx) && log.log_index == Some(a.index))
+    };
+    if announced.iter().any(|a| a.block <= to && !present(a)) {
+        return Ok((cursor, Pass::Lagging));
+    }
+    commit(state, &logs, to).await?;
+    Ok((to, if to == target { Pass::Done } else { Pass::More }))
+}
+
+async fn get_logs(state: &AppState, from: u64, to: u64) -> Result<Vec<Log>> {
     let filter = Filter::new()
         .address(state.chain.contract)
-        .from_block(cursor + 1)
+        .from_block(from)
         .to_block(to);
-    let logs = state
+    state
         .chain
         .provider
         .get_logs(&filter)
         .await
-        .context("get logs")?;
+        .context("get logs")
+}
 
+/// Applies the logs and moves the cursor to `to` in one transaction, then announces the events.
+async fn commit(state: &AppState, logs: &[Log], to: u64) -> Result<()> {
     let mut tx = state.db.begin().await?;
-    let events = apply_logs(&mut tx, &state.chain, &logs).await?;
+    let events = apply_logs(&mut tx, &state.chain, logs).await?;
     sqlx::query(
         "insert into indexer_state (id, last_block) values (true, $1)
          on conflict (id) do update set last_block = excluded.last_block",
@@ -114,7 +308,7 @@ async fn tick(state: &AppState, cursor: u64) -> Result<(u64, bool)> {
     for event in events {
         let _ = state.events.send(event);
     }
-    Ok((to, to == head))
+    Ok(())
 }
 
 /// Applies a batch of logs and returns the events to broadcast. A log that can never be stored,
@@ -487,13 +681,89 @@ mod tests {
         ));
     }
 
+    /// A log from our contract that the indexer doesn't act on, standing in for any event.
+    fn announced_log(block: u64, index: u64) -> (Log, Announced) {
+        let tx = B256::repeat_byte(0x11);
+        let log = Log {
+            inner: PrimitiveLog {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(vec![B256::repeat_byte(0x99)], Bytes::new()),
+            },
+            block_number: Some(block),
+            transaction_hash: Some(tx),
+            log_index: Some(index),
+            ..Default::default()
+        };
+        (log, Announced { block, tx, index })
+    }
+
+    async fn stored_cursor(db: &PgPool) -> Option<i64> {
+        sqlx::query_scalar("select last_block from indexer_state")
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn an_announcement_is_indexed_with_one_query(db: PgPool) {
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        let (log, announced) = announced_log(12, 0);
+
+        rpc.push_success(&vec![log]);
+        assert_eq!(
+            catch_up(&state, 5, &[announced]).await.unwrap(),
+            (12, Pass::Done)
+        );
+        assert!(rpc.read_q().is_empty(), "no head lookup needed");
+        assert_eq!(stored_cursor(&db).await, Some(12));
+    }
+
+    #[sqlx::test]
+    async fn a_lagging_node_never_moves_the_cursor_past_an_announcement(db: PgPool) {
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        let (_, announced) = announced_log(12, 3);
+
+        rpc.push_success(&Vec::<Log>::new());
+        assert_eq!(
+            catch_up(&state, 5, &[announced]).await.unwrap(),
+            (5, Pass::Lagging)
+        );
+        assert_eq!(stored_cursor(&db).await, None);
+    }
+
+    #[sqlx::test]
+    async fn announcements_already_indexed_cost_nothing(db: PgPool) {
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        let (_, announced) = announced_log(12, 0);
+
+        assert_eq!(
+            catch_up(&state, 12, &[announced]).await.unwrap(),
+            (12, Pass::Done)
+        );
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn a_burst_of_announcements_is_read_together(db: PgPool) {
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        let (first, a) = announced_log(12, 0);
+        let (second, b) = announced_log(15, 1);
+
+        rpc.push_success(&vec![first, second]);
+        assert_eq!(
+            catch_up(&state, 5, &[a, b]).await.unwrap(),
+            (15, Pass::Done)
+        );
+        assert_eq!(stored_cursor(&db).await, Some(15));
+    }
+
     #[sqlx::test]
     async fn indexes_up_to_the_block_before_the_head(db: PgPool) {
         let (state, rpc) = testing::state(db.clone(), Arc::default());
 
         rpc.push_success(&"0xa");
         rpc.push_success(&Vec::<Log>::new());
-        assert_eq!(tick(&state, 5).await.unwrap(), (9, true));
+        assert_eq!(tick(&state, 5).await.unwrap(), (9, Pass::Done));
         let cursor: i64 = sqlx::query_scalar("select last_block from indexer_state")
             .fetch_one(&db)
             .await
@@ -501,7 +771,7 @@ mod tests {
         assert_eq!(cursor, 9);
 
         rpc.push_success(&"0xa");
-        assert_eq!(tick(&state, 9).await.unwrap(), (9, true));
+        assert_eq!(tick(&state, 9).await.unwrap(), (9, Pass::Done));
         assert!(rpc.read_q().is_empty());
     }
 }

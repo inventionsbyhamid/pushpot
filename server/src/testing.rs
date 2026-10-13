@@ -125,7 +125,9 @@ pub fn state(db: PgPool, oracle: Arc<FakeOracle>) -> (AppState, Asserter) {
         deploy_block: 0,
         oracle_signer: PrivateKeySigner::random(),
         web_dir: "/nonexistent".into(),
+        ws_url: None,
         indexer_interval: Duration::from_secs(1),
+        indexer_idle_interval: Duration::from_secs(60),
         curator_enabled: false,
         fee_collector_enabled: false,
     };
