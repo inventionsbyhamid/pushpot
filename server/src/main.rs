@@ -8,12 +8,18 @@ mod pots;
 mod share;
 mod state;
 mod telemetry;
+#[cfg(test)]
+mod testing;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use tokio::{net::TcpListener, signal, sync::broadcast};
+use tokio::{
+    net::TcpListener,
+    signal,
+    sync::{Semaphore, broadcast},
+};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -22,6 +28,8 @@ use crate::{
     http::RateLimiter,
     state::AppState,
 };
+
+const MAX_EVENT_STREAMS: usize = 2_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,12 +67,15 @@ async fn main() -> anyhow::Result<()> {
         oracle: Arc::new(Oracle::spawn(&config)),
         events,
         auth_limiter: Arc::new(RateLimiter::new(30, Duration::from_secs(60))),
+        workout_limiter: Arc::new(RateLimiter::new(20, Duration::from_secs(60))),
+        event_streams: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
         index_html: std::fs::read_to_string(config.web_dir.join("index.html"))
             .ok()
             .map(Into::into),
     };
 
     tokio::spawn(chain::indexer::run(state.clone()));
+    tokio::spawn(sweep_stuck_workouts(db.clone()));
     tokio::spawn(prune_expired(db));
 
     let listener = TcpListener::bind(config.bind_addr).await?;
@@ -91,6 +102,18 @@ async fn prune_expired(db: PgPool) {
             .await;
         if let Err(err) = nonces.and(sessions) {
             tracing::warn!(error = %err, "pruning expired auth rows failed");
+        }
+    }
+}
+
+async fn sweep_stuck_workouts(db: PgPool) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+        match api::workouts::sweep_stuck(&db).await {
+            Ok(0) => {}
+            Ok(swept) => tracing::warn!(swept, "settled workouts stuck mid-check-in"),
+            Err(err) => tracing::warn!(error = %err, "sweeping stuck workouts failed"),
         }
     }
 }

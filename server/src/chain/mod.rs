@@ -2,11 +2,15 @@ pub mod indexer;
 pub mod oracle;
 
 use alloy::{
-    primitives::{Address, B256, Bytes, FixedBytes, eip191_hash_message},
+    contract::Error as ContractError,
+    primitives::{Address, B256, Bytes, U256, eip191_hash_message},
     providers::{DynProvider, Provider, ProviderBuilder},
+    rpc::types::TransactionRequest,
     sol,
+    sol_types::SolCall,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, anyhow, ensure};
+use url::{Position, Url};
 
 use crate::config::Config;
 
@@ -45,15 +49,15 @@ sol! {
         error AlreadyCheckedIn();
 
         function checkIn(uint256 potId, address member, uint16 period, uint16 reps, bytes32 evidenceHash) external;
+        function getMember(uint256 potId, address account) external view returns (bool joined, bool claimed, uint16 checkIns, uint128 periodBits);
     }
 
-    #[sol(rpc)]
     interface IERC1271 {
         function isValidSignature(bytes32 hash, bytes signature) external view returns (bytes4);
     }
 }
 
-const ERC1271_MAGIC: FixedBytes<4> = FixedBytes([0x16, 0x26, 0xba, 0x7e]);
+const ERC1271_MAGIC: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 
 #[derive(Clone)]
 pub struct Chain {
@@ -68,7 +72,12 @@ impl Chain {
         let provider = ProviderBuilder::new()
             .connect_http(config.rpc_url.clone())
             .erased();
-        let chain_id = provider.get_chain_id().await.context("reading chain id")?;
+        let chain_id = provider.get_chain_id().await.map_err(|err| {
+            anyhow!(
+                "reading chain id: {}",
+                redact_url(&err.to_string(), &config.rpc_url)
+            )
+        })?;
         ensure!(
             chain_id == config.chain_id,
             "RPC is on chain {chain_id}, expected {}",
@@ -82,6 +91,13 @@ impl Chain {
         })
     }
 
+    /// Reads membership straight from the contract, for when the indexer hasn't caught up.
+    pub async fn is_member(&self, pot_id: u64, account: Address) -> Result<bool, ContractError> {
+        let pot = IPushPot::new(self.contract, &self.provider);
+        let member = pot.getMember(U256::from(pot_id), account).call().await?;
+        Ok(member.joined)
+    }
+
     /// ERC-1271 check for smart-contract wallets signing an EIP-191 message.
     pub async fn is_valid_contract_signature(
         &self,
@@ -89,11 +105,125 @@ impl Chain {
         message: &str,
         signature: &[u8],
     ) -> bool {
+        // Precompiles and EOAs have no code, and some precompiles echo the calldata back, which
+        // a lenient decoder would read as the magic value.
+        match self.provider.get_code_at(signer).await {
+            Ok(code) if !code.is_empty() => {}
+            _ => return false,
+        }
         let hash: B256 = eip191_hash_message(message.as_bytes());
-        let wallet = IERC1271::new(signer, &self.provider);
-        matches!(
-            wallet.isValidSignature(hash, Bytes::copy_from_slice(signature)).call().await,
-            Ok(magic) if magic == ERC1271_MAGIC
-        )
+        let calldata = IERC1271::isValidSignatureCall {
+            hash,
+            signature: Bytes::copy_from_slice(signature),
+        }
+        .abi_encode();
+        let call = TransactionRequest::default()
+            .to(signer)
+            .input(Bytes::from(calldata).into());
+        self.provider
+            .call(call)
+            .await
+            .is_ok_and(|output| is_erc1271_magic(&output))
+    }
+}
+
+/// A well-formed `bytes4` return: the magic value, left-aligned in exactly one zero-padded word.
+fn is_erc1271_magic(output: &[u8]) -> bool {
+    output.len() == 32 && output[..4] == ERC1271_MAGIC && output[4..].iter().all(|&b| b == 0)
+}
+
+/// Strips the parts of the RPC URL that may hold an API key from text bound for logs. Transport
+/// errors quote the full request URL.
+pub fn redact_url(text: &str, url: &Url) -> String {
+    let origin = url.origin().ascii_serialization();
+    let text = text.replace(url.as_str(), &origin);
+    match &url[Position::BeforePath..] {
+        "" | "/" => text,
+        secret => text.replace(secret, ""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::{providers::ProviderBuilder, sol_types::SolValue, transports::mock::Asserter};
+
+    use super::*;
+
+    fn chain(rpc: &Asserter) -> Chain {
+        Chain {
+            provider: ProviderBuilder::new()
+                .connect_mocked_client(rpc.clone())
+                .erased(),
+            contract: Address::repeat_byte(0xcc),
+            chain_id: 5042,
+            deploy_block: 0,
+        }
+    }
+
+    fn word(prefix: &[u8]) -> Bytes {
+        let mut word = [0u8; 32];
+        word[..prefix.len()].copy_from_slice(prefix);
+        Bytes::from(word.to_vec())
+    }
+
+    #[test]
+    fn erc1271_requires_an_exact_magic_word() {
+        assert!(is_erc1271_magic(&word(&ERC1271_MAGIC)));
+        assert!(!is_erc1271_magic(&ERC1271_MAGIC));
+        assert!(!is_erc1271_magic(&word(&[0x16, 0x26, 0xba, 0x7e, 0x01])));
+        let mut echoed = word(&ERC1271_MAGIC).to_vec();
+        echoed.extend_from_slice(&[0u8; 64]);
+        assert!(!is_erc1271_magic(&echoed));
+    }
+
+    #[tokio::test]
+    async fn contract_signatures_need_code_and_the_magic_word() {
+        let rpc = Asserter::new();
+        let chain = chain(&rpc);
+        let wallet = Address::repeat_byte(0x77);
+
+        rpc.push_success(&Bytes::new());
+        assert!(!chain.is_valid_contract_signature(wallet, "hi", &[1]).await);
+        assert!(rpc.read_q().is_empty(), "no call without code");
+
+        rpc.push_success(&Bytes::from_static(&[0x60, 0x00]));
+        rpc.push_success(&word(&ERC1271_MAGIC));
+        assert!(chain.is_valid_contract_signature(wallet, "hi", &[1]).await);
+
+        rpc.push_success(&Bytes::from_static(&[0x60, 0x00]));
+        rpc.push_success(&word(&[0x16, 0x26, 0xba, 0x7e, 0xff]));
+        assert!(!chain.is_valid_contract_signature(wallet, "hi", &[1]).await);
+    }
+
+    #[tokio::test]
+    async fn reads_membership_from_the_contract() {
+        let rpc = Asserter::new();
+        let chain = chain(&rpc);
+        let encoded = |joined: bool| Bytes::from((joined, false, 0u16, 0u128).abi_encode_params());
+
+        rpc.push_success(&encoded(true));
+        assert!(chain.is_member(1, Address::ZERO).await.unwrap());
+        rpc.push_success(&encoded(false));
+        assert!(!chain.is_member(1, Address::ZERO).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn redacts_rpc_keys_from_transport_errors() {
+        let url: Url = "http://127.0.0.1:9/v2/s3cr3t-key?token=abc"
+            .parse()
+            .unwrap();
+        let provider = ProviderBuilder::new().connect_http(url.clone());
+        let err = provider.get_block_number().await.unwrap_err().to_string();
+
+        let redacted = redact_url(&err, &url);
+        assert!(!redacted.contains("s3cr3t"), "{redacted}");
+        assert!(!redacted.contains("token=abc"), "{redacted}");
+        assert_eq!(
+            redact_url(
+                "error sending request for url (http://127.0.0.1:9/v2/s3cr3t-key?token=abc)",
+                &url
+            ),
+            "error sending request for url (http://127.0.0.1:9)"
+        );
     }
 }

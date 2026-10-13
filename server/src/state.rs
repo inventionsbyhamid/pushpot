@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use sqlx::PgPool;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 use crate::{chain::Chain, chain::oracle::CheckInSender, config::Config, http::RateLimiter};
 
@@ -13,7 +13,12 @@ pub struct AppState {
     pub chain: Chain,
     pub oracle: Arc<dyn CheckInSender>,
     pub events: broadcast::Sender<PotEvent>,
+    /// Keyed by client IP.
     pub auth_limiter: Arc<RateLimiter>,
+    /// Keyed by the signed-in address.
+    pub workout_limiter: Arc<RateLimiter>,
+    /// One permit per open event stream.
+    pub event_streams: Arc<Semaphore>,
     /// The built `index.html`, used to render link previews. `None` when the web app isn't built.
     pub index_html: Option<Arc<str>>,
 }

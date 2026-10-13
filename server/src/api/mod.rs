@@ -1,5 +1,5 @@
 pub mod pots;
-mod workouts;
+pub mod workouts;
 
 use axum::{
     Router,

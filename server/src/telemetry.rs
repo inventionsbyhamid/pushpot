@@ -1,10 +1,12 @@
 //! Server-side checks on the rep telemetry recorded by the browser.
 //!
 //! The browser counts reps on-device, so the server can't see the video. Instead it checks that
-//! the reported reps are physically plausible, recounts them from the raw elbow-angle trace and
-//! looks for signs of a synthetic signal.
+//! the reported reps are physically plausible, that each one shows up in the raw angle trace,
+//! recounts them independently and looks for signs of a synthetic signal.
 
-use alloy::primitives::{B256, keccak256};
+use std::ops::Range;
+
+use alloy::primitives::{B256, Keccak256, keccak256};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -14,11 +16,20 @@ const UP_ANGLE: u8 = 145;
 const MIN_REP_MS: f64 = 400.0;
 const MAX_REP_MS: f64 = 8_000.0;
 const MIN_SWING: f64 = 45.0;
-const MIN_BODY_LINE: f64 = 140.0;
+const MIN_BODY_LINE: u8 = 140;
 const MIN_REP_VISIBILITY: f64 = 0.4;
 const MAX_REPS_PER_MINUTE: f64 = 130.0;
 const MAX_FRAMES: usize = 60_000;
 const MAX_REPS: usize = 1_000;
+/// Clients start their clock once `POST /api/workouts` returns, so this only covers latency.
+const CLOCK_SLACK_MS: f64 = 1_500.0;
+/// How far a rep's reported depth may sit from the lowest trace sample inside the rep.
+const DEPTH_TOLERANCE: f64 = 8.0;
+/// Even a fast rep moves the smoothed elbow angle well under this between frames ≤ 50 ms apart.
+const MAX_ELBOW_STEP: u8 = 35;
+const MAX_STEP_DT: u8 = 50;
+/// A camera signal never sits on one value for this share of frames.
+const MAX_FLAT_SHARE: f64 = 0.98;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Telemetry {
@@ -58,6 +69,8 @@ pub struct Context {
 pub struct Verdict {
     pub reps: u32,
     pub recount: u32,
+    /// Identifies the camera trace regardless of the workout it was submitted for.
+    pub fingerprint: B256,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -86,10 +99,14 @@ pub enum Rejection {
     LowFrameRate,
     #[error("you weren't visible clearly enough")]
     LowVisibility,
+    #[error("the camera lost track of you too often")]
+    TrackingGlitches,
     #[error("the camera trace doesn't match the counted reps")]
     RecountMismatch,
     #[error("the rep pattern looks synthetic")]
     Synthetic,
+    #[error("this camera trace was already submitted")]
+    Replayed,
 }
 
 pub fn evidence_hash(raw_json: &str) -> B256 {
@@ -114,7 +131,7 @@ pub fn validate(t: &Telemetry, ctx: &Context) -> Result<Verdict, Rejection> {
     }
     if !t.duration_ms.is_finite()
         || t.duration_ms <= 0.0
-        || t.duration_ms > ctx.server_elapsed_ms + 5_000.0
+        || t.duration_ms > ctx.server_elapsed_ms + CLOCK_SLACK_MS
     {
         return Err(Rejection::DurationMismatch);
     }
@@ -127,9 +144,11 @@ pub fn validate(t: &Telemetry, ctx: &Context) -> Result<Verdict, Rejection> {
 
     let trace = decode_trace(&t.trace)?;
     check_trace(&trace, t.reps.len(), t.duration_ms)?;
+    check_reps_in_trace(&t.reps, &trace)?;
 
+    // The two counters use slightly different thresholds, so allow one rep of disagreement.
     let recount = recount(&trace.elbow, &trace.dt);
-    if recount < ctx.reps_target {
+    if recount < ctx.reps_target || (recount as usize) + 1 < t.reps.len() {
         return Err(Rejection::RecountMismatch);
     }
 
@@ -140,6 +159,7 @@ pub fn validate(t: &Telemetry, ctx: &Context) -> Result<Verdict, Rejection> {
     Ok(Verdict {
         reps: t.reps.len() as u32,
         recount,
+        fingerprint: trace.fingerprint(),
     })
 }
 
@@ -173,7 +193,7 @@ fn check_reps(reps: &[Rep], duration_ms: f64) -> Result<(), Rejection> {
         {
             return Err(Rejection::RepRange(n));
         }
-        if rep.min_body < MIN_BODY_LINE {
+        if rep.min_body < f64::from(MIN_BODY_LINE) {
             return Err(Rejection::RepForm(n));
         }
         if rep.vis < MIN_REP_VISIBILITY {
@@ -187,7 +207,29 @@ fn check_reps(reps: &[Rep], duration_ms: f64) -> Result<(), Rejection> {
 struct DecodedTrace {
     dt: Vec<u8>,
     elbow: Vec<u8>,
+    body: Vec<u8>,
     vis: Vec<u8>,
+}
+
+impl DecodedTrace {
+    /// Each frame's time on the workout clock, the same clock rep times use.
+    fn times(&self) -> Vec<f64> {
+        self.dt
+            .iter()
+            .scan(0.0, |t, &delta| {
+                *t += f64::from(delta);
+                Some(*t)
+            })
+            .collect()
+    }
+
+    fn fingerprint(&self) -> B256 {
+        let mut hasher = Keccak256::new();
+        for channel in [&self.dt, &self.elbow, &self.body, &self.vis] {
+            hasher.update(channel);
+        }
+        hasher.finalize()
+    }
 }
 
 fn decode_trace(trace: &Trace) -> Result<DecodedTrace, Rejection> {
@@ -206,7 +248,12 @@ fn decode_trace(trace: &Trace) -> Result<DecodedTrace, Rejection> {
     if elbow.iter().chain(&body).any(|&deg| deg > 180) {
         return Err(Rejection::MalformedTrace);
     }
-    Ok(DecodedTrace { dt, elbow, vis })
+    Ok(DecodedTrace {
+        dt,
+        elbow,
+        body,
+        vis,
+    })
 }
 
 fn check_trace(trace: &DecodedTrace, reps: usize, duration_ms: f64) -> Result<(), Rejection> {
@@ -215,10 +262,9 @@ fn check_trace(trace: &DecodedTrace, reps: usize, duration_ms: f64) -> Result<()
         return Err(Rejection::LowFrameRate);
     }
 
-    // `dt` is capped at 255 ms per frame, so a paused or stalled camera makes the sum fall short
-    // of the wall-clock duration; only an overshoot is impossible.
+    // The client's workout clock advances by exactly the recorded frame intervals.
     let total: f64 = trace.dt.iter().map(|&d| f64::from(d)).sum();
-    if total > duration_ms * 1.1 + 500.0 || total < duration_ms * 0.6 {
+    if (total - duration_ms).abs() > duration_ms * 0.1 {
         return Err(Rejection::MalformedTrace);
     }
 
@@ -231,6 +277,69 @@ fn check_trace(trace: &DecodedTrace, reps: usize, duration_ms: f64) -> Result<()
     let mean_vis = trace.vis.iter().map(|&v| f64::from(v)).sum::<f64>() / frames as f64;
     if mean_vis < 0.5 * 255.0 {
         return Err(Rejection::LowVisibility);
+    }
+
+    let flat = flat_value(&trace.dt).is_some()
+        || flat_value(&trace.body).is_some()
+        // A confident pose model can pin visibility at the top of the scale.
+        || flat_value(&trace.vis).is_some_and(|v| v != u8::MAX);
+    if flat {
+        return Err(Rejection::Synthetic);
+    }
+
+    // Side switches and re-acquiring a lost pose can each cause one jump; a square wave has two
+    // per rep.
+    if elbow_jumps(&trace.elbow, &trace.dt) > 2 + frames / 100 {
+        return Err(Rejection::TrackingGlitches);
+    }
+    Ok(())
+}
+
+/// The value that fills nearly all of `channel`, if any.
+fn flat_value(channel: &[u8]) -> Option<u8> {
+    let mut counts = [0usize; 256];
+    for &value in channel {
+        counts[usize::from(value)] += 1;
+    }
+    let (value, count) = counts.into_iter().enumerate().max_by_key(|&(_, n)| n)?;
+    (count as f64 >= channel.len() as f64 * MAX_FLAT_SHARE).then_some(value as u8)
+}
+
+fn elbow_jumps(elbow: &[u8], dt: &[u8]) -> usize {
+    elbow
+        .windows(2)
+        .zip(dt.iter().skip(1))
+        .filter(|&(pair, &delta)| {
+            delta <= MAX_STEP_DT && pair[0].abs_diff(pair[1]) > MAX_ELBOW_STEP
+        })
+        .count()
+}
+
+/// Every reported rep must be visible in the trace: a bottom close to the reported depth, a
+/// straight body throughout, and a lockout before it ends.
+fn check_reps_in_trace(reps: &[Rep], trace: &DecodedTrace) -> Result<(), Rejection> {
+    let times = trace.times();
+    let window = |from: f64, to: f64| -> Range<usize> {
+        times.partition_point(|&t| t < from)..times.partition_point(|&t| t <= to)
+    };
+
+    for (i, rep) in reps.iter().enumerate() {
+        let frames = window(rep.start, rep.end);
+        let Some(&lowest) = trace.elbow[frames.clone()].iter().min() else {
+            return Err(Rejection::RecountMismatch);
+        };
+        if (f64::from(lowest) - rep.min_elbow).abs() > DEPTH_TOLERANCE {
+            return Err(Rejection::RecountMismatch);
+        }
+        if trace.body[frames].iter().any(|&deg| deg < MIN_BODY_LINE) {
+            return Err(Rejection::RepForm(i + 1));
+        }
+        if !trace.elbow[window(rep.bottom, rep.end)]
+            .iter()
+            .any(|&deg| deg >= UP_ANGLE)
+        {
+            return Err(Rejection::RecountMismatch);
+        }
     }
     Ok(())
 }
@@ -286,12 +395,14 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
 
 #[cfg(test)]
 pub mod fixtures {
-    use std::f64::consts::TAU;
+    use std::f64::consts::{PI, TAU};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
     use uuid::Uuid;
 
     use super::{Rep, Telemetry, Trace};
+
+    const TOP: f64 = 165.0;
 
     struct Lcg(u64);
 
@@ -303,10 +414,18 @@ pub mod fixtures {
                 .wrapping_add(1442695040888963407);
             (self.0 >> 11) as f64 / (1u64 << 53) as f64
         }
+
+        /// Uniform noise in ±`scale / 2`.
+        fn noise(&mut self, scale: f64) -> f64 {
+            (self.next() - 0.5) * scale
+        }
     }
 
-    /// Simulates `reps` pushups: elbow angle swings between ~80° and ~165°, ~30 fps, with jitter
-    /// in timing and depth like a real person.
+    /// Simulates `reps` pushups the way the browser records them: ~30 fps with frame-timing
+    /// jitter and `dt[0] == 0`, an elbow dipping from ~165° to `bottom` with a pause at the top,
+    /// a body line that sags a little on the way down, and noisy visibility. Rep summaries are
+    /// read off the trace like the client's counter does. With `jitter` off, the reps themselves
+    /// are machine-regular; sensor noise remains.
     pub fn session(
         workout_id: Uuid,
         reps: usize,
@@ -316,54 +435,67 @@ pub mod fixtures {
         jitter: bool,
     ) -> Telemetry {
         let mut rng = Lcg(42);
-        let mut noise = |scale: f64| {
-            if jitter {
-                (rng.next() - 0.5) * scale
-            } else {
-                0.0
-            }
-        };
+        let human = |rng: &mut Lcg, scale: f64| if jitter { rng.noise(scale) } else { 0.0 };
 
-        let cycles: Vec<f64> = (0..reps).map(|_| rep_ms * (1.0 + noise(0.2))).collect();
-        let total: f64 = cycles.iter().sum::<f64>() + 600.0;
+        let mut cycles = Vec::with_capacity(reps);
+        let mut t = 300.0;
+        for _ in 0..reps {
+            let length = rep_ms * (1.0 + human(&mut rng, 0.2));
+            let depth = bottom + human(&mut rng, 6.0);
+            cycles.push((t, length, depth));
+            t += length + 300.0 + human(&mut rng, 300.0);
+        }
+        let end = t;
 
-        let (mut dt, mut elbow, mut body_trace, mut vis) = (vec![], vec![], vec![], vec![]);
-        let mut summaries: Vec<Rep> = vec![];
-        let depths: Vec<f64> = (0..reps).map(|_| bottom + noise(6.0)).collect();
-
+        let (mut dt, mut elbow, mut body_line, mut vis, mut times) =
+            (vec![], vec![], vec![], vec![], vec![]);
         let mut t = 0.0;
-        while t < total {
-            let step = 33.0 + noise(6.0);
+        while t <= end {
+            let step = if dt.is_empty() {
+                0.0
+            } else {
+                (33.0 + rng.noise(6.0)).round()
+            };
             t += step;
-            let (mut cycle_start, mut angle) = (300.0, 165.0);
-            for (k, &len) in cycles.iter().enumerate() {
-                if t >= cycle_start && t < cycle_start + len {
-                    let phase = (t - cycle_start) / len;
-                    let mid = (165.0 + depths[k]) / 2.0;
-                    angle = mid + (165.0 - mid) * (TAU * phase).cos();
-                    break;
-                }
-                cycle_start += len;
-            }
-            dt.push(step.round() as u8);
-            elbow.push((angle + noise(3.0)).round().clamp(0.0, 180.0) as u8);
-            body_trace.push(body);
-            vis.push(230);
+            let rep = cycles
+                .iter()
+                .find(|&&(start, length, _)| (start..start + length).contains(&t));
+            let (angle, sag) = rep.map_or((TOP, 0.0), |&(start, length, depth)| {
+                let phase = (t - start) / length;
+                let mid = (TOP + depth) / 2.0;
+                (
+                    mid + (TOP - mid) * (TAU * phase).cos(),
+                    3.0 * (PI * phase).sin(),
+                )
+            });
+            dt.push(step as u8);
+            times.push(t);
+            elbow.push(degrees(angle + rng.noise(3.0)));
+            body_line.push(degrees(f64::from(body) - sag + rng.noise(3.0)));
+            vis.push((225.0 + rng.noise(20.0)).round() as u8);
         }
 
-        let mut cycle_start = 300.0;
-        for (k, &len) in cycles.iter().enumerate() {
-            summaries.push(Rep {
-                start: cycle_start,
-                bottom: cycle_start + len / 2.0,
-                end: cycle_start + len,
-                min_elbow: depths[k],
-                max_elbow: 165.0,
-                min_body: f64::from(body),
-                vis: 0.9,
-            });
-            cycle_start += len;
-        }
+        let summaries = cycles
+            .iter()
+            .map(|&(start, length, _)| {
+                let frames: Vec<usize> = (0..times.len())
+                    .filter(|&i| (start..=start + length).contains(&times[i]))
+                    .collect();
+                let lowest = *frames.iter().min_by_key(|&&i| elbow[i]).unwrap();
+                let mean_vis = frames.iter().map(|&i| f64::from(vis[i])).sum::<f64>()
+                    / frames.len() as f64
+                    / 255.0;
+                Rep {
+                    start: times[frames[0]],
+                    bottom: times[lowest],
+                    end: times[*frames.last().unwrap()],
+                    min_elbow: f64::from(elbow[lowest]),
+                    max_elbow: f64::from(frames.iter().map(|&i| elbow[i]).max().unwrap()),
+                    min_body: f64::from(frames.iter().map(|&i| body_line[i]).min().unwrap()),
+                    vis: (mean_vis * 100.0).round() / 100.0,
+                }
+            })
+            .collect();
 
         Telemetry {
             v: 1,
@@ -373,10 +505,78 @@ pub mod fixtures {
             trace: Trace {
                 dt: STANDARD.encode(&dt),
                 elbow: STANDARD.encode(&elbow),
-                body: STANDARD.encode(&body_trace),
+                body: STANDARD.encode(&body_line),
                 vis: STANDARD.encode(&vis),
             },
         }
+    }
+
+    /// The cheapest forgery: a square-wave elbow at a fixed frame rate, summaries to match.
+    /// With `noisy_channels`, the other channels get the noise a real camera would add.
+    pub fn square_wave(workout_id: Uuid, reps: usize, noisy_channels: bool) -> Telemetry {
+        let mut rng = Lcg(7);
+        let mut noise = |scale: f64| {
+            if noisy_channels {
+                rng.noise(scale).round()
+            } else {
+                0.0
+            }
+        };
+        let (mut dt, mut elbow, mut body, mut vis) = (vec![], vec![], vec![], vec![]);
+        let mut summaries = vec![];
+        let mut t = 0.0;
+        for i in 0..reps {
+            for frame in 0..16 {
+                let step = if dt.is_empty() {
+                    0.0
+                } else {
+                    33.0 + noise(6.0)
+                };
+                t += step;
+                if frame == 2 {
+                    summaries.push(Rep {
+                        start: t,
+                        bottom: t,
+                        end: t + 13.0 * 33.0,
+                        min_elbow: 78.0 + (i % 7) as f64 * 2.0,
+                        max_elbow: TOP,
+                        min_body: 170.0,
+                        vis: 0.9,
+                    });
+                }
+                dt.push(step as u8);
+                elbow.push(if frame < 2 {
+                    TOP as u8
+                } else {
+                    78 + (i % 7) as u8 * 2
+                });
+                body.push((170.0 + noise(4.0)) as u8);
+                vis.push((200.0 + noise(20.0)) as u8);
+            }
+        }
+        for _ in 0..2 {
+            t += 33.0;
+            dt.push(33);
+            elbow.push(TOP as u8);
+            body.push(170);
+            vis.push(200);
+        }
+        Telemetry {
+            v: 1,
+            workout_id,
+            duration_ms: t,
+            reps: summaries,
+            trace: Trace {
+                dt: STANDARD.encode(&dt),
+                elbow: STANDARD.encode(&elbow),
+                body: STANDARD.encode(&body),
+                vis: STANDARD.encode(&vis),
+            },
+        }
+    }
+
+    fn degrees(value: f64) -> u8 {
+        value.round().clamp(0.0, 180.0) as u8
     }
 }
 
@@ -406,12 +606,25 @@ mod tests {
         }
     }
 
+    fn channel(s: &Session, pick: fn(&Trace) -> &String) -> Vec<u8> {
+        STANDARD.decode(pick(&s.telemetry.trace)).unwrap()
+    }
+
     #[test]
     fn accepts_a_real_looking_session() {
         let s = session(10, 1_200.0, 82.0, 165, true);
         let verdict = validate(&s.telemetry, &ctx(&s, 10)).unwrap();
         assert_eq!(verdict.reps, 10);
         assert!(verdict.recount >= 10, "recount {}", verdict.recount);
+    }
+
+    #[test]
+    fn accepts_fast_slow_and_long_sessions() {
+        for (reps, rep_ms, bottom) in [(5, 800.0, 95.0), (30, 1_000.0, 80.0), (20, 2_500.0, 70.0)] {
+            let s = session(reps, rep_ms, bottom, 172, true);
+            let result = validate(&s.telemetry, &ctx(&s, reps as u32));
+            assert!(result.is_ok(), "{reps} × {rep_ms} ms: {result:?}");
+        }
     }
 
     #[test]
@@ -454,13 +667,43 @@ mod tests {
     }
 
     #[test]
-    fn rejects_session_longer_than_server_saw() {
+    fn rejects_a_sag_the_summaries_leave_out() {
+        let mut s = session(10, 1_200.0, 82.0, 165, true);
+        let rep = s.telemetry.reps[2].clone();
+        let times = decode_trace(&s.telemetry.trace).unwrap().times();
+        let mut body = channel(&s, |t| &t.body);
+        for (deg, &t) in body.iter_mut().zip(&times) {
+            if (rep.bottom..=rep.end).contains(&t) {
+                *deg = 125;
+            }
+        }
+        s.telemetry.trace.body = STANDARD.encode(body);
+        assert_eq!(
+            validate(&s.telemetry, &ctx(&s, 10)),
+            Err(Rejection::RepForm(3))
+        );
+    }
+
+    #[test]
+    fn binds_the_duration_to_the_server_clock() {
         let s = session(10, 1_200.0, 82.0, 165, true);
         let mut context = ctx(&s, 10);
-        context.server_elapsed_ms = s.telemetry.duration_ms - 6_000.0;
+        context.server_elapsed_ms = s.telemetry.duration_ms - 1_000.0;
+        assert!(validate(&s.telemetry, &context).is_ok());
+        context.server_elapsed_ms = s.telemetry.duration_ms - 2_000.0;
         assert_eq!(
             validate(&s.telemetry, &context),
             Err(Rejection::DurationMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_a_duration_the_frames_dont_add_up_to() {
+        let mut s = session(10, 1_200.0, 82.0, 165, true);
+        s.telemetry.duration_ms *= 1.15;
+        assert_eq!(
+            validate(&s.telemetry, &ctx(&s, 10)),
+            Err(Rejection::MalformedTrace)
         );
     }
 
@@ -488,10 +731,42 @@ mod tests {
     #[test]
     fn rejects_reps_missing_from_trace() {
         let mut s = session(10, 1_200.0, 82.0, 165, true);
-        let flat = vec![165u8; STANDARD.decode(&s.telemetry.trace.elbow).unwrap().len()];
+        let flat = vec![165u8; channel(&s, |t| &t.elbow).len()];
         s.telemetry.trace.elbow = STANDARD.encode(flat);
         assert_eq!(
             validate(&s.telemetry, &ctx(&s, 10)),
+            Err(Rejection::RecountMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_rep_depths_the_trace_doesnt_show() {
+        let mut s = session(10, 1_200.0, 82.0, 165, true);
+        s.telemetry.reps[4].min_elbow += 12.0;
+        assert_eq!(
+            validate(&s.telemetry, &ctx(&s, 10)),
+            Err(Rejection::RecountMismatch)
+        );
+    }
+
+    #[test]
+    fn recount_must_cover_all_but_one_reported_rep() {
+        let mut s = session(10, 1_200.0, 82.0, 165, true);
+        // Three reps stop at 110° in the trace while their summaries claim 104°: close enough
+        // to pass the per-rep check, but not a rep to the independent counter.
+        let times = decode_trace(&s.telemetry.trace).unwrap().times();
+        let mut elbow = channel(&s, |t| &t.elbow);
+        for rep in &mut s.telemetry.reps[..3] {
+            for (deg, &t) in elbow.iter_mut().zip(&times) {
+                if (rep.start..=rep.end).contains(&t) {
+                    *deg = (*deg).max(110);
+                }
+            }
+            rep.min_elbow = 104.0;
+        }
+        s.telemetry.trace.elbow = STANDARD.encode(elbow);
+        assert_eq!(
+            validate(&s.telemetry, &ctx(&s, 5)),
             Err(Rejection::RecountMismatch)
         );
     }
@@ -503,6 +778,85 @@ mod tests {
             validate(&s.telemetry, &ctx(&s, 20)),
             Err(Rejection::Synthetic)
         );
+    }
+
+    #[test]
+    fn rejects_constant_channels() {
+        let base = session(10, 1_200.0, 82.0, 165, true);
+        let frames = channel(&base, |t| &t.dt).len();
+        let flatteners: [fn(&mut Telemetry, usize); 3] = [
+            |t: &mut Telemetry, n: usize| t.trace.body = STANDARD.encode(vec![170u8; n]),
+            |t: &mut Telemetry, n: usize| t.trace.vis = STANDARD.encode(vec![230u8; n]),
+            |t: &mut Telemetry, n: usize| {
+                let mut dt = vec![33u8; n];
+                dt[0] = 0;
+                t.trace.dt = STANDARD.encode(dt);
+                t.duration_ms = 33.0 * (n - 1) as f64;
+            },
+        ];
+        for flatten in flatteners {
+            let mut s = session(10, 1_200.0, 82.0, 165, true);
+            flatten(&mut s.telemetry, frames);
+            assert_eq!(
+                validate(&s.telemetry, &ctx(&s, 10)),
+                Err(Rejection::Synthetic)
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_visibility_pinned_at_full_confidence() {
+        let mut s = session(10, 1_200.0, 82.0, 165, true);
+        let frames = channel(&s, |t| &t.vis).len();
+        s.telemetry.trace.vis = STANDARD.encode(vec![255u8; frames]);
+        assert!(validate(&s.telemetry, &ctx(&s, 10)).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_forged_square_wave() {
+        let workout_id = Uuid::new_v4();
+        let context = |t: &Telemetry| Context {
+            workout_id,
+            reps_target: 10,
+            server_elapsed_ms: t.duration_ms + 2_000.0,
+        };
+
+        let forged = fixtures::square_wave(workout_id, 10, false);
+        assert_eq!(
+            validate(&forged, &context(&forged)),
+            Err(Rejection::Synthetic)
+        );
+
+        let forged = fixtures::square_wave(workout_id, 10, true);
+        assert_eq!(
+            validate(&forged, &context(&forged)),
+            Err(Rejection::TrackingGlitches)
+        );
+    }
+
+    #[test]
+    fn tolerates_a_few_tracking_glitches() {
+        let mut s = session(10, 1_200.0, 82.0, 165, true);
+        let mut elbow = channel(&s, |t| &t.elbow);
+        // A one-frame spike, like the pose being re-acquired after an occlusion.
+        elbow[3] = 120;
+        s.telemetry.trace.elbow = STANDARD.encode(elbow);
+        assert!(validate(&s.telemetry, &ctx(&s, 10)).is_ok());
+    }
+
+    #[test]
+    fn fingerprint_identifies_the_trace_not_the_workout() {
+        // The fixture is deterministic, so both workouts carry the same trace.
+        let original = session(10, 1_200.0, 82.0, 165, true);
+        let mut replayed = session(10, 1_200.0, 82.0, 165, true);
+        assert_ne!(original.workout_id, replayed.workout_id);
+        let fingerprint = |s: &Session| validate(&s.telemetry, &ctx(s, 10)).unwrap().fingerprint;
+        assert_eq!(fingerprint(&replayed), fingerprint(&original));
+
+        let mut vis = channel(&replayed, |t| &t.vis);
+        vis[0] = vis[0].wrapping_add(1);
+        replayed.telemetry.trace.vis = STANDARD.encode(vis);
+        assert_ne!(fingerprint(&replayed), fingerprint(&original));
     }
 
     #[test]

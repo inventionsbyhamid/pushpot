@@ -54,6 +54,11 @@ impl Schedule {
             && now < self.period_end(period) + GRACE
     }
 
+    /// Whether the contract has stopped accepting check-ins for every period.
+    pub fn check_ins_closed(&self, now: DateTime<Utc>) -> bool {
+        now >= self.end() + GRACE
+    }
+
     /// Returns `(completed, out)` for a member who checked in for `checked_in` periods.
     pub fn progress(&self, checked_in: &[i32], now: DateTime<Utc>) -> (bool, bool) {
         let completed = (0..self.periods).all(|p| checked_in.contains(&p));
@@ -106,6 +111,8 @@ mod tests {
         assert!(!s.accepts_check_in(0, at(15)));
         assert!(!s.accepts_check_in(1, at(9)));
         assert!(!s.accepts_check_in(3, at(31)));
+        assert!(!s.check_ins_closed(at(34)));
+        assert!(s.check_ins_closed(at(35)));
     }
 
     #[test]

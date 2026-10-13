@@ -13,8 +13,12 @@ use alloy::{
     providers::{DynProvider, Provider, ProviderBuilder},
 };
 use tokio::sync::{mpsc, oneshot};
+use url::Url;
 
-use super::IPushPot::{self, IPushPotErrors};
+use super::{
+    IPushPot::{self, IPushPotErrors},
+    redact_url,
+};
 use crate::config::Config;
 
 /// Arc drops transactions priced below its 20 gwei base-fee floor without a receipt.
@@ -22,6 +26,9 @@ const MIN_MAX_FEE: u128 = 20_000_000_000;
 const PRIORITY_FEE: u128 = 1_000_000_000;
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
 const RECEIPT_POLL: Duration = Duration::from_millis(150);
+/// Jobs that waited longer than this are failed instead of sent, so a backlog drains quickly and
+/// members can retry rather than wait on check-ins nobody is waiting for any more.
+const MAX_QUEUE_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct CheckInRequest {
@@ -53,6 +60,15 @@ pub enum OracleError {
     Unavailable(String),
 }
 
+impl OracleError {
+    fn redacted(self, rpc_url: &Url) -> Self {
+        match self {
+            Self::Unavailable(detail) => Self::Unavailable(redact_url(&detail, rpc_url)),
+            other => other,
+        }
+    }
+}
+
 pub type CheckInFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CheckInReceipt, OracleError>> + Send + 'a>>;
 
@@ -63,6 +79,7 @@ pub trait CheckInSender: Send + Sync {
 struct Job {
     request: CheckInRequest,
     reply: oneshot::Sender<Result<CheckInReceipt, OracleError>>,
+    queued_at: Instant,
 }
 
 pub struct Oracle {
@@ -80,7 +97,12 @@ impl Oracle {
             .connect_http(config.rpc_url.clone())
             .erased();
         let (jobs, rx) = mpsc::channel(64);
-        tokio::spawn(worker(provider, config.contract, rx));
+        tokio::spawn(worker(
+            provider,
+            config.contract,
+            config.rpc_url.clone(),
+            rx,
+        ));
         Self { jobs }
     }
 }
@@ -89,8 +111,13 @@ impl CheckInSender for Oracle {
     fn check_in(&self, request: CheckInRequest) -> CheckInFuture<'_> {
         Box::pin(async move {
             let (reply, rx) = oneshot::channel();
+            let queued_at = Instant::now();
             self.jobs
-                .send(Job { request, reply })
+                .send(Job {
+                    request,
+                    reply,
+                    queued_at,
+                })
                 .await
                 .map_err(|_| OracleError::Unavailable("oracle is shutting down".into()))?;
             rx.await
@@ -99,21 +126,41 @@ impl CheckInSender for Oracle {
     }
 }
 
-async fn worker(provider: DynProvider, contract: Address, mut jobs: mpsc::Receiver<Job>) {
+async fn worker(
+    provider: DynProvider,
+    contract: Address,
+    rpc_url: Url,
+    mut jobs: mpsc::Receiver<Job>,
+) {
     let pot = IPushPot::new(contract, provider.clone());
     while let Some(job) = jobs.recv().await {
-        let result = submit(&provider, &pot, &job.request).await;
+        let request = &job.request;
+        if job.reply.is_closed() {
+            tracing::warn!(pot_id = request.pot_id, member = %request.member, "check-in abandoned");
+            continue;
+        }
+        if job.queued_at.elapsed() > MAX_QUEUE_WAIT {
+            tracing::warn!(pot_id = request.pot_id, member = %request.member, "check-in expired in queue");
+            let _ = job.reply.send(Err(OracleError::Unavailable(
+                "check-in queue is backed up".into(),
+            )));
+            continue;
+        }
+
+        let result = submit(&provider, &pot, request)
+            .await
+            .map_err(|err| err.redacted(&rpc_url));
         match &result {
             Ok(receipt) => tracing::info!(
-                pot_id = job.request.pot_id,
-                member = %job.request.member,
-                period = job.request.period,
+                pot_id = request.pot_id,
+                member = %request.member,
+                period = request.period,
                 tx = %receipt.tx_hash,
                 latency_ms = receipt.latency_ms,
                 "check-in recorded"
             ),
             Err(err) => {
-                tracing::warn!(pot_id = job.request.pot_id, error = %err, "check-in failed")
+                tracing::warn!(pot_id = request.pot_id, error = %err, "check-in failed")
             }
         }
         let _ = job.reply.send(result);
@@ -192,4 +239,56 @@ fn classify(err: ContractError) -> OracleError {
 
 fn unavailable(err: impl std::fmt::Display) -> OracleError {
     OracleError::Unavailable(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::{providers::ProviderBuilder, transports::mock::Asserter};
+
+    use super::*;
+
+    fn job(queued_at: Instant) -> (Job, oneshot::Receiver<Result<CheckInReceipt, OracleError>>) {
+        let (reply, rx) = oneshot::channel();
+        let request = CheckInRequest {
+            pot_id: 1,
+            member: Address::ZERO,
+            period: 0,
+            reps: 10,
+            evidence: B256::ZERO,
+        };
+        let job = Job {
+            request,
+            reply,
+            queued_at,
+        };
+        (job, rx)
+    }
+
+    #[tokio::test]
+    async fn skips_abandoned_and_expired_jobs_without_sending() {
+        let rpc = Asserter::new();
+        // Any RPC call the worker makes would consume this.
+        rpc.push_success(&"0x");
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(rpc.clone())
+            .erased();
+        let (jobs, rx) = mpsc::channel(4);
+        let url = "https://rpc.test".parse().unwrap();
+        let worker = tokio::spawn(worker(provider, Address::ZERO, url, rx));
+
+        let (abandoned, receiver) = job(Instant::now());
+        drop(receiver);
+        jobs.send(abandoned).await.unwrap();
+        let (expired, receiver) = job(Instant::now() - MAX_QUEUE_WAIT - Duration::from_secs(1));
+        jobs.send(expired).await.unwrap();
+
+        let result = receiver.await.unwrap();
+        assert!(
+            matches!(&result, Err(OracleError::Unavailable(detail)) if detail.contains("backed up")),
+            "{result:?}"
+        );
+        drop(jobs);
+        worker.await.unwrap();
+        assert_eq!(rpc.read_q().len(), 1);
+    }
 }

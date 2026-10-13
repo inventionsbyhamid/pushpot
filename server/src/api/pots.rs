@@ -2,13 +2,13 @@ use std::{collections::HashMap, convert::Infallible, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     response::sse::{Event, KeepAlive, Sse},
     routing::get,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
@@ -107,50 +107,23 @@ pub async fn find_pot(state: &AppState, id: i64) -> AppResult<PotRow> {
         .ok_or(AppError::NotFound)
 }
 
-#[derive(Deserialize)]
-struct ListQuery {
-    scope: Option<String>,
-}
-
 #[derive(Serialize)]
 struct ListResponse {
     pots: Vec<PotView>,
 }
 
-async fn list(
-    State(state): State<AppState>,
-    session: Option<Session>,
-    Query(query): Query<ListQuery>,
-) -> AppResult<Json<ListResponse>> {
-    let rows = match query.scope.as_deref().unwrap_or("open") {
-        "open" => {
-            sqlx::query_as::<_, PotRow>(select_pots!(
-                "where p.start_time > now() order by p.start_time asc limit 50"
-            ))
-            .fetch_all(&state.db)
-            .await?
-        }
-        "mine" => {
-            let session = session.ok_or(AppError::Unauthorized)?;
-            sqlx::query_as::<_, PotRow>(select_pots!(
-                "join members me on me.pot_id = p.id and me.address = $1 and me.active
-                 order by p.start_time desc limit 100"
-            ))
-            .bind(&session.address)
-            .fetch_all(&state.db)
-            .await?
-        }
-        _ => return Err(AppError::BadRequest("scope must be open or mine".into())),
-    };
+/// The caller's own pots. Pots are invite-only, so there is no public listing.
+async fn list(State(state): State<AppState>, session: Session) -> AppResult<Json<ListResponse>> {
+    let rows = sqlx::query_as::<_, PotRow>(select_pots!(
+        "join members me on me.pot_id = p.id and me.address = $1 and me.active
+         order by p.start_time desc limit 100"
+    ))
+    .bind(&session.address)
+    .fetch_all(&state.db)
+    .await?;
 
     let now = Utc::now();
-    let pots = rows
-        .into_iter()
-        .map(|row| PotView::new(row, now))
-        .filter(|pot| {
-            query.scope.as_deref() == Some("mine") || pot.member_count < i64::from(pot.max_members)
-        })
-        .collect();
+    let pots = rows.into_iter().map(|row| PotView::new(row, now)).collect();
     Ok(Json(ListResponse { pots }))
 }
 
@@ -229,15 +202,24 @@ async fn detail(
 async fn events(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream =
-        BroadcastStream::new(state.events.subscribe()).filter_map(move |event| async move {
+) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    find_pot(&state, id).await?;
+    let permit = state
+        .event_streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::Unavailable("too many live connections, try again soon".into()))?;
+    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(move |event| {
+        // The stream owns the permit, so the slot frees up when the client disconnects.
+        let _permit = &permit;
+        async move {
             let event = event.ok().filter(|e| e.pot_id == id)?;
             Event::default()
                 .event(event.kind.as_str())
                 .json_data(&event)
                 .ok()
                 .map(Ok)
-        });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

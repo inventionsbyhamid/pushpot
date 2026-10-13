@@ -63,12 +63,13 @@ requires HTTPS, which the reverse proxy in front of the container provides.
   for a member, with at least the target reps. The oracle can't backfill or rewrite history.
 - **Liveness.** If the oracle goes offline for the whole challenge, nobody completes and
   everyone is refunded.
-- **Evidence.** Each check-in emits `evidenceHash = keccak256(telemetry)`, and the telemetry is
-  public at `/api/evidence/:hash`.
+- **Evidence.** Each check-in emits `evidenceHash = keccak256(telemetry)`. The telemetry is
+  published at `/api/evidence/:hash` once the pot stops accepting check-ins, so nobody can copy
+  a live trace mid-challenge.
 - **Limits.** Client-side detection can be spoofed by someone determined. The server raises the
-  bar: it recounts reps from the raw angle trace and runs plausibility checks on timing,
-  range of motion and signal statistics. Stronger proofs (peer-reviewed clips, attested
-  devices) are future work.
+  bar: it checks every reported rep against the raw angle trace, recounts reps from it, runs
+  plausibility checks on timing, range of motion and signal statistics, and refuses a trace it
+  has seen before. Stronger proofs (peer-reviewed clips, attested devices) are future work.
 - **Caps.** The contract is small and tested but unaudited. Stake is capped at 50 USDC per
   member, and a pot holds at most 50 members.
 
@@ -116,7 +117,8 @@ everything the indexer needs.
 1. `GET /api/auth/nonce` issues a single-use nonce (valid 10 minutes).
 2. The client signs a SIWE message built with viem.
 3. `POST /api/auth/verify` checks domain, chain ID, nonce and expiry, and recovers the EIP-191
-   signer. For smart-contract wallets it falls back to ERC-1271 `isValidSignature`.
+   signer. For smart-contract wallets it falls back to ERC-1271 `isValidSignature`, which must
+   come from an address with code and return exactly the magic value in one zero-padded word.
 4. The session is an HttpOnly cookie holding a random token. Only its SHA-256 is stored, with a
    7 day expiry.
 
@@ -124,8 +126,14 @@ everything the indexer needs.
 
 - It polls `eth_getLogs` for the contract about once per second, in ranges of at most 9,999
   blocks (the RPC caps a query at 10k).
+- It stays one block behind the head: behind a load balancer, the node answering `eth_getLogs`
+  may not have the block another node reported as the head yet.
 - Each batch is applied in one database transaction together with the `last_block` cursor, so
   every log is applied exactly once.
+- A log that can never be stored (undecodable, or data Postgres rejects) is logged and skipped
+  rather than retried forever, which would stall every join and check-in after it. Titles are
+  stripped of control characters. RPC and connection errors retry the whole batch, and 15
+  failed attempts in a row log an error.
 - Arc's finality is deterministic, so there is no reorg handling.
 - After a commit, the indexer publishes events to SSE subscribers.
 
@@ -134,15 +142,28 @@ everything the indexer needs.
 - One task owns the oracle key, so nonces never race.
 - Requests arrive over a channel. The task sends `checkIn` with `maxFeePerGas` ≥ 20 gwei
   (Arc's floor: anything lower is silently dropped), then polls for the receipt.
+- A request that waited more than 30 s in the queue fails without being sent, so a backlog
+  clears quickly and the member can retry.
 - A check-in costs roughly $0.002 and confirms in about a second.
 
 **Workouts.**
 
 1. `POST /api/workouts {pot_id}` checks the caller is an active member, that a period is
-   running, and that they haven't checked in yet. It records `started_at` on the server.
-2. `POST /api/workouts/:id/complete {telemetry}` validates the telemetry, stores it, submits
-   `checkIn`, and returns the transaction hash and latency. A rejection returns a readable
-   reason.
+   running, and that they haven't checked in yet. A join the indexer hasn't seen yet is
+   confirmed with `getMember` on the contract. It returns the member's open workout for the
+   period if there is one, keeping its `started_at`, and otherwise records a new one with
+   `started_at` set on the server.
+2. `POST /api/workouts/:id/complete {telemetry}` checks the period has no check-in yet,
+   validates the telemetry, stores it, submits `checkIn`, and returns the transaction hash and
+   latency. A rejection returns a readable reason, and only the reason, the payload's hash and
+   its size are stored.
+
+- At most one workout per member and period can be submitting or recorded (a unique index).
+- The check-in runs on its own task, so a client that disconnects can't abandon it half-way.
+  Every 30 s, workouts stuck in `submitting` for 2 minutes (after a crash or redeploy) become
+  `recorded` if their check-in reached the chain, and `failed` otherwise, which the member can
+  complete again.
+- Both endpoints are rate-limited to 20 requests a minute per address.
 
 ### API
 
@@ -154,12 +175,12 @@ All JSON uses snake_case. Amounts are in USDC base units (6 decimals) as integer
 | `POST /api/auth/verify {message, signature}` | `{address}` + session cookie |
 | `POST /api/auth/logout` | `204` |
 | `GET /api/me` | `{address}` or `401` |
-| `GET /api/pots?scope=open\|mine` | `{pots: Pot[]}` |
+| `GET /api/pots` | the caller's pots, `{pots: Pot[]}`, or `401`. Pots are invite-only, so there is no public listing. |
 | `GET /api/pots/:id` | `{pot: Pot, members: Member[]}` |
-| `GET /api/pots/:id/events` | SSE: `joined`, `left`, `checked_in`, `claimed` |
-| `POST /api/workouts {pot_id}` | `{workout_id, period, reps_target, period_ends_at}` |
-| `POST /api/workouts/:id/complete {telemetry}` | `{status: "recorded", tx_hash, latency_ms}` or `422 {error}` |
-| `GET /api/evidence/:hash` | the stored telemetry |
+| `GET /api/pots/:id/events` | SSE: `joined`, `left`, `checked_in`, `claimed`; `404` for an unknown pot, `503` while 2,000 streams are open |
+| `POST /api/workouts {pot_id}` | `{workout_id, period, reps_target, period_ends_at}`; `409` if the period is checked in or a check-in is in flight |
+| `POST /api/workouts/:id/complete {telemetry}` | `{status: "recorded", tx_hash, latency_ms}`, `422 {error}`, or `409` if the period is checked in or a check-in is in flight |
+| `GET /api/evidence/:hash` | the stored telemetry once the pot stops accepting check-ins, `404` until then |
 | `GET /healthz` | `ok` |
 
 ```
@@ -197,7 +218,8 @@ Field notes:
 
 - Rep times are milliseconds since counting started. Angles are in degrees.
 - `trace` holds one sample per processed frame:
-  - `dt`: milliseconds since the previous frame, capped at 255;
+  - `dt`: milliseconds since the previous frame (0 for the first), capped at 255. The workout
+    clock advances by exactly these intervals, so `Σdt` equals `duration_ms`;
   - `elbow`: smoothed elbow angle, 0–180;
   - `body`: shoulder–hip–ankle angle, 0–180;
   - `vis`: mean visibility × 255.
@@ -205,7 +227,7 @@ Field notes:
 The server rejects a workout when any of these fail:
 
 - **Session.** There are at least `reps_target` reps, and `duration_ms` ≤ server-observed
-  elapsed time + 5 s.
+  elapsed time + 1.5 s (the client starts its clock after `POST /api/workouts` returns).
 - **Per rep.**
   - no overlap with the previous rep, and rep ends at least 400 ms apart;
   - duration 400–8000 ms;
@@ -217,11 +239,20 @@ The server rejects a workout when any of these fail:
   - `Σdt` within 10% of `duration_ms`;
   - median frame rate ≥ 10 fps;
   - mean visibility ≥ 0.5.
+- **Reps in the trace.** Within each rep's time window, the trace's lowest elbow angle is within
+  8° of `min_elbow`, the body line never drops below 140°, and the elbow locks out (≥ 145°)
+  between the bottom and the end.
 - **Recount.** The server recounts reps from `trace.elbow` with an independent hysteresis
-  counter (down ≤ 105°, up ≥ 145°, cycle ≥ 400 ms), and the result must reach `reps_target`.
-- **Synthetic signals.** With 15+ reps, rep durations must not be near-identical (coefficient
-  of variation < 3%). With 5+ reps, the minimum elbow angles must not be (standard deviation
-  < 1°).
+  counter (down ≤ 105°, up ≥ 145°, cycle ≥ 400 ms). The result must reach `reps_target` and be
+  at least the number of reported reps minus one.
+- **Synthetic signals.**
+  - with 15+ reps, rep durations must not be near-identical (coefficient of variation < 3%);
+  - with 5+ reps, the minimum elbow angles must not be (standard deviation < 1°);
+  - `dt`, `body` and `vis` must vary: no single value may fill 98% of a channel;
+  - the elbow angle may jump more than 35° between frames ≤ 50 ms apart at most
+    2 + (1% of frames) times. A tracking glitch causes one jump; a square wave causes two per rep.
+- **Replay.** The server stores a keccak-256 fingerprint of the decoded trace channels under a
+  unique index, so a trace already submitted for another workout is rejected.
 
 ## Web app
 
@@ -299,8 +330,14 @@ Money is involved, so the defaults are conservative.
 - *Sessions.* A random 256-bit token in an `HttpOnly`, `Secure`, `SameSite=Lax` cookie with the
   `__Host-` prefix. Only its SHA-256 is stored.
 - *CSRF.* Every non-GET `/api` request must carry our exact `Origin`. Bodies must be JSON.
-- *Limits.* Bodies are capped at 64 KB (512 KB for telemetry), and auth endpoints are
-  rate-limited per IP.
+- *Limits.*
+  - bodies are capped at 64 KB (512 KB for telemetry);
+  - auth endpoints are rate-limited per IP, and workout endpoints per address;
+  - each member has at most one open workout and one check-in in flight per period;
+  - rejected telemetry is not stored, only its hash and size;
+  - at most 2,000 event streams are open at once.
+- *RPC URL.* Providers often put an API key in the URL, so errors and logs show only its
+  origin.
 - *Response headers:*
   - a CSP that allows `'self'` plus the Arc RPC and WalletConnect;
   - `frame-ancestors 'none'`;

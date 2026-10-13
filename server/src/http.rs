@@ -106,7 +106,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
     }
 }
 
-/// Fixed-window limiter keyed by client IP.
+/// Fixed-window rate limiter keyed by an arbitrary string, such as a client IP or an address.
 pub struct RateLimiter {
     limit: u32,
     window: Duration,
