@@ -295,8 +295,8 @@ The server rejects a workout when any of these fail:
 - **Per rep.**
   - no overlap with the previous rep, and rep ends at least 400 ms apart;
   - duration 400–8000 ms;
-  - min elbow ≤ 105°, max ≥ 145°, swing ≥ 45°;
-  - min body line ≥ 140°;
+  - min elbow ≤ 115°, max ≥ 140°, swing ≥ 30°;
+  - min body line ≥ 130°;
   - visibility ≥ 0.4.
 - **Trace.**
   - channels have equal lengths, with at least 5 frames per rep;
@@ -304,13 +304,13 @@ The server rejects a workout when any of these fail:
   - median frame rate ≥ 10 fps;
   - mean visibility ≥ 0.5.
 - **Reps in the trace.** Within each rep's time window, the trace's lowest elbow angle is within
-  8° of `min_elbow`, the body line never drops below 140°, and the elbow locks out (≥ 145°)
+  8° of `min_elbow`, the body line never drops below 130°, and the elbow locks out (≥ 140°)
   between the bottom and the end.
 - **Recount.** The server recounts reps from `trace.elbow` with an independent hysteresis
-  counter (down ≤ 105°, up ≥ 145°, at least 250 ms below 145°). The result must reach
+  counter (down ≤ 115°, up ≥ 140°, at least 250 ms below 140°). The result must reach
   `reps_target` and be at least the number of reported reps minus one. The 250 ms is shorter
   than the 400 ms rep minimum because the client may count from a lockout of up to 155°, so a
-  fast honest rep spends well under 400 ms below 145°.
+  fast honest rep spends well under 400 ms below 140°.
 - **Synthetic signals.**
   - with 15+ reps, rep durations must not be near-identical (coefficient of variation < 3%);
   - with 5+ reps, the minimum elbow angles must not be (standard deviation < 1°);
@@ -355,13 +355,16 @@ with the `pose_landmarker_lite` model.
 - *Side selection:* uses the more visible side, with hysteresis.
 - *Smoothing:* a median-of-3 filter, then a One Euro filter (min cutoff 1.0 Hz, β 0.02).
 - *Frame gating:* a frame counts only if shoulder, hip, elbow and wrist visibility are ≥ 0.5.
-- *Down:* elbow ≤ 100° for two frames.
-- *Up:* elbow ≥ 150° for two frames.
+- *Down:* elbow ≤ 110° for two frames. A side-on camera reads the bottom a little shallow, so
+  this is a chest close to the floor; the guide still coaches 90°.
+- *Up:* elbow ≥ 140° for two frames, adapting after three reps to 12° under the user's own
+  top, between 140° and 155°. The server checks against 5° to 10° looser limits, because one failed
+  rep rejects the whole workout.
 - *A rep counts only if:*
   - the cycle is ≥ 500 ms;
   - ≥ 500 ms have passed since the last rep;
   - ≥ 5 valid frames, at ≥ 70% valid;
-  - min body line ≥ 145°;
+  - min body line ≥ 135°;
   - wrist drift ≤ 0.25 × torso length.
 - *Feedback:* partial reps produce "go lower", "lock out", "hips sagging" and "move into frame".
 

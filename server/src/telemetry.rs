@@ -11,15 +11,17 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const DOWN_ANGLE: u8 = 105;
-const UP_ANGLE: u8 = 145;
+// A few degrees looser than the client's 110° and 135°, since one failed rep rejects the workout.
+const DOWN_ANGLE: u8 = 115;
+const UP_ANGLE: u8 = 140;
 const MIN_REP_MS: f64 = 400.0;
-/// The recount times a rep from 145°, while the client may already count from its adapted
-/// lockout of up to 155°, so a fast honest rep spends well under `MIN_REP_MS` below 145°.
+/// The recount times a rep from 140°, while the client may already count from its adapted
+/// lockout of up to 155°, so a fast honest rep spends well under `MIN_REP_MS` below 140°.
 const MIN_RECOUNT_MS: f64 = 250.0;
 const MAX_REP_MS: f64 = 8_000.0;
-const MIN_SWING: f64 = 45.0;
-const MIN_BODY_LINE: u8 = 140;
+/// The client's shallowest counted rep: lockout at 140°, bottom at 110°.
+const MIN_SWING: f64 = 30.0;
+const MIN_BODY_LINE: u8 = 130;
 const MIN_REP_VISIBILITY: f64 = 0.4;
 const MAX_REPS_PER_MINUTE: f64 = 130.0;
 const MAX_FRAMES: usize = 60_000;
@@ -682,7 +684,7 @@ mod tests {
     #[test]
     fn counts_fast_reps_after_the_client_lockout_adapted_to_155() {
         // From a 167° top the client raises its lockout to 155°. Its 600 ms reps still last
-        // over 400 ms from that lockout, but some spend under 400 ms below the recount's 145°.
+        // over 400 ms from that lockout, but some spend under 400 ms below the recount's 140°.
         let workout_id = Uuid::new_v4();
         let telemetry = fixtures::Pushups {
             reps: 12,
@@ -696,7 +698,7 @@ mod tests {
 
         let trace = decode_trace(&telemetry.trace).unwrap();
         let times = trace.times();
-        let below_145 = |rep: &Rep| -> f64 {
+        let below_lockout = |rep: &Rep| -> f64 {
             times
                 .iter()
                 .zip(&trace.elbow)
@@ -711,7 +713,12 @@ mod tests {
                 .iter()
                 .all(|rep| rep.end - rep.start >= MIN_REP_MS)
         );
-        assert!(telemetry.reps.iter().any(|rep| below_145(rep) < MIN_REP_MS));
+        assert!(
+            telemetry
+                .reps
+                .iter()
+                .any(|rep| below_lockout(rep) < MIN_REP_MS)
+        );
 
         let context = Context {
             workout_id,
@@ -720,6 +727,27 @@ mod tests {
         };
         let verdict = validate(&telemetry, &context).unwrap();
         assert_eq!(verdict.recount, 12);
+    }
+
+    #[test]
+    fn accepts_the_shallowest_reps_the_client_counts() {
+        // Arms that read 145° when straight, a bottom short of 90° and a slight bend at the hips.
+        let workout_id = Uuid::new_v4();
+        let telemetry = fixtures::Pushups {
+            top: 145.0,
+            bottom: 104.0,
+            lockout: 140.0,
+            body: 140,
+            ..Default::default()
+        }
+        .record(workout_id);
+        let context = Context {
+            workout_id,
+            reps_target: 10,
+            server_elapsed_ms: telemetry.duration_ms,
+        };
+        let verdict = validate(&telemetry, &context).unwrap();
+        assert_eq!(verdict.recount, 10);
     }
 
     #[test]
@@ -745,7 +773,7 @@ mod tests {
 
     #[test]
     fn rejects_shallow_reps() {
-        let s = session(10, 1_200.0, 120.0, 165, true);
+        let s = session(10, 1_200.0, 130.0, 165, true);
         assert!(matches!(
             validate(&s.telemetry, &ctx(&s, 10)),
             Err(Rejection::RepRange(_))
@@ -847,17 +875,17 @@ mod tests {
     #[test]
     fn recount_must_cover_all_but_one_reported_rep() {
         let mut s = session(10, 1_200.0, 82.0, 165, true);
-        // Three reps stop at 110° in the trace while their summaries claim 104°: close enough
+        // Three reps stop at 122° in the trace while their summaries claim 115°: close enough
         // to pass the per-rep check, but not a rep to the independent counter.
         let times = decode_trace(&s.telemetry.trace).unwrap().times();
         let mut elbow = channel(&s, |t| &t.elbow);
         for rep in &mut s.telemetry.reps[..3] {
             for (deg, &t) in elbow.iter_mut().zip(&times) {
                 if (rep.start..=rep.end).contains(&t) {
-                    *deg = (*deg).max(110);
+                    *deg = (*deg).max(122);
                 }
             }
-            rep.min_elbow = 104.0;
+            rep.min_elbow = 115.0;
         }
         s.telemetry.trace.elbow = STANDARD.encode(elbow);
         assert_eq!(

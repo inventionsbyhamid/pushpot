@@ -69,13 +69,15 @@ export interface CounterConfig {
   maxRepMs: number;
 }
 
+// A side-on camera reads the bottom a little shallower than it is, so 110° is a chest close to
+// the floor; the guide still coaches 90°.
 export const DEFAULT_CONFIG: CounterConfig = {
-  downAngle: 100,
-  upAngle: 150,
-  // The server recounts with a 145° lockout, so the client never accepts less.
-  upAngleRange: [145, 155],
-  plankAngle: 150,
-  minBodyAngle: 145,
+  downAngle: 110,
+  // The server recounts with a 140° lockout, so the client never accepts less.
+  upAngle: 140,
+  upAngleRange: [140, 155],
+  plankAngle: 140,
+  minBodyAngle: 135,
   minCycleMs: 500,
   maxRepMs: 8000,
 };
@@ -97,7 +99,7 @@ const TOP_HISTORY = 5;
 const ADAPT_AFTER_REPS = 3;
 const SHALLOW_ANGLE = 135;
 const REBOUND_ANGLE = 130;
-const REDROP_ANGLE = 110;
+const REDROP_ANGLE = 120;
 const STALE_DESCENT_MS = 4000;
 const CUE_HOLD_MS = 2000;
 

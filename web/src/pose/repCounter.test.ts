@@ -57,6 +57,28 @@ describe("createRepCounter", () => {
     expect(result.cues).toContain("go_lower");
   });
 
+  it("counts reps that stop a little short of 90°", () => {
+    const { curve, durationMs } = sequence(hold(165, 1000), reps(5, 1200, 105, 165), hold(165, 1000));
+    const result = run(synthesize({ durationMs, elbow: curve, jitterPx: 1.5, seed: 3 }));
+
+    expect(result.count).toBe(5);
+  });
+
+  it("counts reps whose arms read short of fully straight", () => {
+    const { curve, durationMs } = sequence(hold(143, 1000), reps(5, 1200, 80, 143), hold(143, 1000));
+    const result = run(synthesize({ durationMs, elbow: curve }));
+
+    expect(result.count).toBe(5);
+  });
+
+  it("tolerates a slight bend at the hips", () => {
+    const { curve, durationMs } = sequence(hold(165, 1500), reps(5, 1200, 80, 165), hold(165, 1000));
+    const body = (t: number) => (t < 1500 ? 178 : 142);
+    const result = run(synthesize({ durationMs, elbow: curve, body }));
+
+    expect(result.count).toBe(5);
+  });
+
   it("does not count reps faster than the minimum cycle", () => {
     const { curve, durationMs } = sequence(hold(165, 1000), reps(10, 350, 80, 165), hold(165, 1000));
     const result = run(synthesize({ durationMs, elbow: curve }));
@@ -86,8 +108,8 @@ describe("createRepCounter", () => {
     const { curve, durationMs } = sequence(
       hold(165, 1000),
       ramp(165, 80, 600),
-      ramp(80, 140, 500),
-      ramp(140, 80, 500),
+      ramp(80, 136, 500),
+      ramp(136, 80, 500),
       ramp(80, 165, 600),
       hold(165, 1000),
     );
