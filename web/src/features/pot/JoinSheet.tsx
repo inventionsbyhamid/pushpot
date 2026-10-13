@@ -19,7 +19,14 @@ export function JoinSheet({ pot, open, onClose }: JoinSheetProps) {
 
   const confirm = async () => {
     if (stake.data === undefined) return;
-    const result = await flow.run((report) => joinPot(BigInt(pot.id), stake.data, report));
+    const terms = {
+      stake: stake.data,
+      repsPerPeriod: pot.reps_per_period,
+      periods: pot.periods,
+      periodSeconds: pot.period_seconds,
+      startTime: Math.round(Date.parse(pot.start_time) / 1000),
+    };
+    const result = await flow.run((report) => joinPot(BigInt(pot.id), terms, report));
     if (result) void queryClient.invalidateQueries({ queryKey: potKeys.detail(pot.id) });
   };
 

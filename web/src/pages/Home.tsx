@@ -1,15 +1,14 @@
 import type { ReactNode } from "react";
-import { Link } from "react-router";
 import { Button, ButtonLink } from "../components/Button";
 import { PotList } from "../components/PotList";
 import { useAuth } from "../lib/auth";
 import { describeError } from "../lib/errors";
-import { usePots } from "../lib/queries";
+import { useMyPots } from "../lib/queries";
 
 const steps = [
   {
     title: "Stake",
-    body: "Everyone puts the same amount of USDC into the pot before it starts.",
+    body: "Start a pot and invite your friends with a link. Everyone puts in the same amount of USDC before it starts.",
   },
   {
     title: "Do your reps",
@@ -24,8 +23,7 @@ const steps = [
 export default function Home() {
   const auth = useAuth();
   const signedIn = auth.status === "authenticated";
-  const open = usePots("open");
-  const mine = usePots("mine", auth.address, signedIn);
+  const mine = useMyPots(auth.address, signedIn);
 
   return (
     <>
@@ -54,20 +52,6 @@ export default function Home() {
         <PotSection title="Your pots" query={mine} empty="You're not in any pots yet." />
       )}
 
-      <PotSection
-        title="Open pots"
-        query={open}
-        empty={
-          <>
-            No open pots right now.{" "}
-            <Link to="/create" className="font-semibold text-volt underline underline-offset-4">
-              Start one
-            </Link>{" "}
-            and invite your friends.
-          </>
-        }
-      />
-
       <section className="mt-12" aria-labelledby="how-it-works">
         <h2 id="how-it-works" className="font-display text-4xl font-extrabold">
           How it works
@@ -92,7 +76,7 @@ export default function Home() {
 
 interface PotSectionProps {
   title: string;
-  query: ReturnType<typeof usePots>;
+  query: ReturnType<typeof useMyPots>;
   empty: ReactNode;
 }
 

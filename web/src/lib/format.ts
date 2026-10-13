@@ -29,7 +29,7 @@ export function formatUsdcExact(value: bigint | number): string {
 }
 
 export function shortAddress(address: string): string {
-  return `${address.slice(0, 4)}…${address.slice(-2)}`;
+  return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }
 
 export function shortHash(hash: string): string {

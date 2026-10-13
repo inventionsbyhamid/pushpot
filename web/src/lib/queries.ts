@@ -2,11 +2,9 @@ import { useQuery } from "@tanstack/react-query";
 import { api, ApiError } from "./api";
 import type { Pot, PotDetail } from "./types";
 
-export type PotScope = "open" | "mine";
-
 export const potKeys = {
   lists: ["pots"] as const,
-  list: (scope: PotScope, viewer: string | null) => ["pots", scope, viewer] as const,
+  mine: (viewer: string | null) => ["pots", "mine", viewer] as const,
   detail: (id: number) => ["pot", id] as const,
 };
 
@@ -27,10 +25,10 @@ export function usePot(id: number | null) {
   });
 }
 
-export function usePots(scope: PotScope, viewer: string | null = null, enabled = true) {
+export function useMyPots(viewer: string | null, enabled: boolean) {
   return useQuery({
-    queryKey: potKeys.list(scope, viewer),
-    queryFn: async () => (await api.get<{ pots: Pot[] }>(`/api/pots?scope=${scope}`)).pots,
+    queryKey: potKeys.mine(viewer),
+    queryFn: async () => (await api.get<{ pots: Pot[] }>("/api/pots?scope=mine")).pots,
     enabled,
   });
 }

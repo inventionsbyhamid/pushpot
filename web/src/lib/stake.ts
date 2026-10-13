@@ -73,15 +73,24 @@ export function readUsdcBalance(owner: Address): Promise<bigint> {
   });
 }
 
-export async function readPotStake(potId: bigint): Promise<bigint> {
-  const pot = await readContract(wagmiConfig, {
+function readPot(potId: bigint) {
+  return readContract(wagmiConfig, {
     chainId: chain.id,
     address: pushPotAddress,
     abi: pushPotAbi,
     functionName: "getPot",
     args: [potId],
   });
-  return pot.stake;
+}
+
+/** The terms a user reviewed before joining. */
+export interface JoinTerms {
+  stake: bigint;
+  repsPerPeriod: number;
+  periods: number;
+  periodSeconds: number;
+  /** Unix seconds. */
+  startTime: number;
 }
 
 async function ensureFunds(owner: Address, stake: bigint): Promise<void> {
@@ -168,21 +177,22 @@ export async function createPot(
 }
 
 /**
- * `expectedStake` is the amount the user reviewed. The stake is re-read from the contract and
- * must match before anything is signed.
+ * Every term the user reviewed is re-read from the contract and must match before anything is
+ * signed, so a stale or tampered API response can't misstate what they're joining.
  */
-export async function joinPot(
-  potId: bigint,
-  expectedStake: bigint,
-  report: ReportStep,
-): Promise<TxOutcome> {
+export async function joinPot(potId: bigint, terms: JoinTerms, report: ReportStep): Promise<TxOutcome> {
   const owner = connectedOnArc();
-  const stake = await readPotStake(potId);
-  if (stake !== expectedStake) {
-    throw new Error(
-      "The on-chain stake differs from the amount shown. Reload the page and review it.",
-    );
+  const pot = await readPot(potId);
+  const matches =
+    pot.stake === terms.stake &&
+    pot.repsPerPeriod === terms.repsPerPeriod &&
+    pot.periods === terms.periods &&
+    pot.periodSeconds === terms.periodSeconds &&
+    pot.startTime === BigInt(terms.startTime);
+  if (!matches) {
+    throw new Error("This pot's on-chain terms differ from what's shown. Reload the page and review them.");
   }
+  const stake = pot.stake;
   await ensureFunds(owner, stake);
 
   report("sign");
