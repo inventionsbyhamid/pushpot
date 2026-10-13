@@ -1,0 +1,47 @@
+use std::sync::Arc;
+
+use serde::Serialize;
+use sqlx::PgPool;
+use tokio::sync::broadcast;
+
+use crate::{chain::Chain, chain::oracle::CheckInSender, config::Config, http::RateLimiter};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: PgPool,
+    pub config: Arc<Config>,
+    pub chain: Chain,
+    pub oracle: Arc<dyn CheckInSender>,
+    pub events: broadcast::Sender<PotEvent>,
+    pub auth_limiter: Arc<RateLimiter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PotEventKind {
+    Joined,
+    Left,
+    CheckedIn,
+    Claimed,
+}
+
+impl PotEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Joined => "joined",
+            Self::Left => "left",
+            Self::CheckedIn => "checked_in",
+            Self::Claimed => "claimed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PotEvent {
+    pub pot_id: i64,
+    pub kind: PotEventKind,
+    pub address: String,
+    pub period: Option<i32>,
+    pub reps: Option<i32>,
+    pub tx_hash: String,
+}

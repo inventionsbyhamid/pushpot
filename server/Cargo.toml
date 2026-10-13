@@ -1,0 +1,32 @@
+[package]
+name = "pushpot-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = { version = "2.5", features = ["provider-http", "signer-local", "sol-types", "contract", "rpc-types", "network"] }
+anyhow = "1.0.104"
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+base64 = "0.23.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+futures-util = "0.3.34"
+hex = "0.4.3"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = "0.11.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
+thiserror = "2.0.21"
+time = "0.3.55"
+tokio = { version = "1.53", features = ["full"] }
+tokio-stream = "0.1.19"
+tower-http = { version = "0.7", features = ["fs", "trace", "compression-br", "compression-gzip", "set-header", "limit"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+url = "2.5.8"
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5", features = ["util"] }
