@@ -306,8 +306,28 @@ async fn curate(state: &AppState, now: DateTime<Utc>) -> Result<()> {
         .await
         .context("block number")?;
 
+    // On a fresh or restored database the indexer must see existing challenges first, or they'd
+    // be opened a second time.
+    if !indexer_caught_up(&state.db, head).await? {
+        tracing::info!(
+            head,
+            "waiting for the indexer to catch up before opening challenges"
+        );
+        return Ok(());
+    }
+
     reconcile(state, ours, head).await?;
     open_missing(state, now, max_stake, head).await
+}
+
+/// Lag the indexer may have and still count as current; it trails the head by design.
+const INDEXER_SLACK_BLOCKS: u64 = 20;
+
+async fn indexer_caught_up(db: &PgPool, head: u64) -> Result<bool> {
+    let indexed: Option<i64> = sqlx::query_scalar("select last_block from indexer_state")
+        .fetch_optional(db)
+        .await?;
+    Ok(indexed.is_some_and(|block| block as u64 + INDEXER_SLACK_BLOCKS >= head))
 }
 
 /// Opens every upcoming instance that doesn't exist yet. `head` is a block no new transaction can
@@ -345,6 +365,9 @@ async fn open(
     head: u64,
 ) -> Result<()> {
     let params = template.params(start);
+    if adopt_existing(&state.db, template, start, &params.title).await? {
+        return Ok(());
+    }
     let claimed = sqlx::query(
         "insert into challenges (template_key, start_time, title, from_block)
          values ($1, $2, $3, $4)
@@ -463,6 +486,39 @@ async fn created_by(
         start = end + 1;
     }
     Ok(pots)
+}
+
+/// Records an instance that is already on chain, for example one opened before the database was
+/// restored, instead of opening it again.
+async fn adopt_existing(
+    db: &PgPool,
+    template: &Template,
+    start: DateTime<Utc>,
+    title: &str,
+) -> Result<bool> {
+    let adopted = sqlx::query(
+        "insert into challenges (template_key, start_time, title, from_block, state, pot_id, created_tx)
+         select $1, $2, $3, p.created_block, 'created', p.id, p.created_tx
+         from pots p where p.official and p.title = $3 and p.start_time = $2
+         order by p.id limit 1
+         on conflict (template_key, start_time) do nothing",
+    )
+    .bind(template.key)
+    .bind(start)
+    .bind(title)
+    .execute(db)
+    .await?;
+    if adopted.rows_affected() > 0 {
+        return Ok(true);
+    }
+    let known: bool = sqlx::query_scalar(
+        "select exists(select 1 from challenges where template_key = $1 and start_time = $2)",
+    )
+    .bind(template.key)
+    .bind(start)
+    .fetch_one(db)
+    .await?;
+    Ok(known)
 }
 
 async fn mark_created(
@@ -612,6 +668,48 @@ mod tests {
         .fetch_all(db)
         .await
         .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn adopts_challenges_already_on_chain(db: PgPool) {
+        let daily = template("daily-20");
+        let start = daily.upcoming(now())[0];
+        sqlx::query(
+            "insert into pots (id, creator, title, stake, reps_per_period, periods, period_seconds,
+                 start_time, max_members, created_tx, created_block, official)
+             values (77, '0xcurator', $1, 1000000, 20, 1, 86400, $2, 1000, '0xabc', 5, true)",
+        )
+        .bind(daily.title(start))
+        .bind(start)
+        .execute(&db)
+        .await
+        .unwrap();
+        let oracle = Arc::new(FakeOracle::default());
+        let (state, _) = testing::state(db.clone(), oracle.clone());
+
+        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
+
+        assert_eq!(oracle.challenge_titles().len(), 13);
+        assert!(!oracle.challenge_titles().contains(&daily.title(start)));
+        let adopted: (String, Option<i64>) = sqlx::query_as(
+            "select state, pot_id from challenges where template_key = 'daily-20' and start_time = $1",
+        )
+        .bind(start)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(adopted, ("created".to_owned(), Some(77)));
+    }
+
+    #[sqlx::test]
+    async fn waits_for_the_indexer_on_a_fresh_database(db: PgPool) {
+        assert!(!indexer_caught_up(&db, 1_000).await.unwrap());
+        sqlx::query("insert into indexer_state (id, last_block) values (true, 990)")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(indexer_caught_up(&db, 1_000).await.unwrap());
+        assert!(!indexer_caught_up(&db, 2_000).await.unwrap());
     }
 
     #[sqlx::test]
