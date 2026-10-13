@@ -9,8 +9,9 @@ RUN pnpm install --frozen-lockfile
 COPY web/ ./
 ARG VITE_CHAIN_ID=5042
 ARG VITE_PUSHPOT_ADDRESS
+ARG VITE_ORACLE_ADDRESS
 ARG VITE_WALLETCONNECT_PROJECT_ID
-RUN test -n "$VITE_PUSHPOT_ADDRESS" && pnpm build
+RUN test -n "$VITE_PUSHPOT_ADDRESS" && test -n "$VITE_ORACLE_ADDRESS" && pnpm build
 RUN find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' \
       -o -name '*.wasm' -o -name '*.json' \) -size +1k \
       -exec gzip -k -9 {} \; -exec brotli -k -q 11 {} \;

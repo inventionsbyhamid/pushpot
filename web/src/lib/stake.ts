@@ -15,7 +15,7 @@ import {
   writeContract,
 } from "wagmi/actions";
 import { pushPotAbi } from "./abi";
-import { chain, pushPotAddress, usdcAddress } from "./config";
+import { chain, pushPotAddress, trustedOracle, usdcAddress } from "./config";
 import { formatUsdc } from "./format";
 import { GAS_HEADROOM, usdcAbi } from "./usdc";
 import { wagmiConfig } from "./wagmi";
@@ -148,6 +148,21 @@ function potLogs(receipt: TransactionReceipt) {
   return receipt.logs.filter((log) => isAddressEqual(log.address, pushPotAddress));
 }
 
+class UntrustedOracleError extends Error {
+  constructor() {
+    super("This pot isn't judged by PushPot's oracle, so the app won't stake money in it.");
+  }
+}
+
+function readOracle(): Promise<Address> {
+  return readContract(wagmiConfig, {
+    chainId: chain.id,
+    address: pushPotAddress,
+    abi: pushPotAbi,
+    functionName: "oracle",
+  });
+}
+
 function readFeeBps(): Promise<number> {
   return readContract(wagmiConfig, {
     chainId: chain.id,
@@ -164,6 +179,8 @@ export async function createPot(
   report: ReportStep,
 ): Promise<TxOutcome & { potId: bigint }> {
   const owner = connectedOnArc();
+  // A new pot is bound to whichever oracle the contract names right now.
+  if (!isAddressEqual(await readOracle(), trustedOracle)) throw new UntrustedOracleError();
   if ((await readFeeBps()) !== feeBps) {
     throw new Error("PushPot's fee changed since you loaded this page. Reload and review it.");
   }
@@ -203,6 +220,7 @@ export async function joinPot(
 ): Promise<TxOutcome> {
   const owner = connectedOnArc();
   const pot = await readPot(potId);
+  if (!isAddressEqual(pot.oracle, trustedOracle)) throw new UntrustedOracleError();
   const matches =
     pot.stake === terms.stake &&
     pot.repsPerPeriod === terms.repsPerPeriod &&

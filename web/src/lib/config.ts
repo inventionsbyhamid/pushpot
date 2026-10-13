@@ -11,6 +11,10 @@ export const pushPotAddress: Address = getAddress(
   import.meta.env.VITE_PUSHPOT_ADDRESS ?? "0x0000000000000000000000000000000000000000",
 );
 export const usdcAddress: Address = "0x3600000000000000000000000000000000000000";
+/** The only oracle the app trusts to judge pots; it refuses to stake into pots judged by any other. */
+export const trustedOracle: Address = getAddress(
+  import.meta.env.VITE_ORACLE_ADDRESS ?? "0x0000000000000000000000000000000000000000",
+);
 export const usdcDecimals = 6;
 export const explorerUrl = chain.blockExplorers.default.url;
 export const walletConnectProjectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID ?? "";

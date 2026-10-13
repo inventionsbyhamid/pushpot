@@ -61,6 +61,14 @@ async fn main() -> anyhow::Result<()> {
         oracle = %config.oracle_signer.address(),
         "connected to Arc"
     );
+    match chain.oracle().await {
+        Ok(oracle) if oracle == config.oracle_signer.address() => {}
+        Ok(oracle) => tracing::error!(
+            %oracle,
+            "the contract assigns new pots to a different oracle; this server can't check them in"
+        ),
+        Err(err) => tracing::warn!(error = %err, "could not read the contract's oracle"),
+    }
 
     let (events, _) = broadcast::channel(256);
     let state = AppState {

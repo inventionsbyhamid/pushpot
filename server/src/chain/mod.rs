@@ -89,6 +89,7 @@ sol! {
         function getMember(uint256 potId, address account) external view returns (bool joined, bool claimed, uint16 checkIns, uint128 periodBits);
         function collectableFee(uint256 potId) external view returns (uint256);
         function curator() external view returns (address);
+        function oracle() external view returns (address);
         function maxStake() external view returns (uint128);
     }
 
@@ -164,6 +165,11 @@ impl Chain {
 
     pub async fn curator(&self) -> Result<Address, ContractError> {
         self.pushpot().curator().call().await
+    }
+
+    /// The oracle new pots are bound to.
+    pub async fn oracle(&self) -> Result<Address, ContractError> {
+        self.pushpot().oracle().call().await
     }
 
     pub async fn max_stake(&self) -> Result<u128, ContractError> {

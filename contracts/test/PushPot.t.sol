@@ -803,6 +803,79 @@ contract PushPotTest is Test {
         pot.removeCurator();
     }
 
+    function test_PrivilegedRolesCannotMoveStakes() public {
+        uint256 id = _create();
+        _join(id, bob);
+        _join(id, carol);
+        uint256 held = usdc.balanceOf(address(pot));
+        address attacker = makeAddr("attacker");
+
+        vm.startPrank(owner);
+        pot.setPaused(true);
+        pot.setPaused(false);
+        pot.setFee(pot.MAX_FEE_BPS());
+        pot.setTreasury(attacker);
+        pot.setCurator(attacker);
+        pot.removeCurator();
+        pot.setOracle(attacker);
+        pot.revokeOracle(oracle);
+        pot.transferOwnership(attacker);
+        vm.stopPrank();
+        vm.prank(attacker);
+        pot.acceptOwnership();
+
+        assertEq(usdc.balanceOf(address(pot)), held);
+        address[4] memory roles = [owner, attacker, oracle, treasury];
+        for (uint256 i; i < roles.length; i++) {
+            assertEq(usdc.allowance(address(pot), roles[i]), 0);
+            vm.prank(roles[i]);
+            vm.expectRevert(PushPot.NotEnded.selector);
+            pot.claim(id);
+        }
+
+        _warpPastEnd(id);
+        for (uint256 i; i < roles.length; i++) {
+            vm.prank(roles[i]);
+            vm.expectRevert(PushPot.NothingToClaim.selector);
+            pot.claim(id);
+        }
+        vm.expectRevert(PushPot.NothingToClaim.selector);
+        pot.collectFee(id);
+
+        // The revoked oracle left nobody completing, so every member gets exactly their stake.
+        for (uint256 i; i < 3; i++) {
+            address member = [alice, bob, carol][i];
+            uint256 before = usdc.balanceOf(member);
+            vm.prank(member);
+            pot.claim(id);
+            assertEq(usdc.balanceOf(member) - before, STAKE);
+        }
+        assertEq(usdc.balanceOf(address(pot)), 0);
+        assertEq(usdc.balanceOf(attacker), 0);
+    }
+
+    function test_FeeNeverExceedsForfeitsAndNeverTouchesWinners() public {
+        uint256 id = _create();
+        _join(id, bob);
+        _join(id, carol);
+        uint16 maxFee = pot.MAX_FEE_BPS();
+        vm.prank(owner);
+        pot.setFee(maxFee);
+
+        PushPot.Pot memory p = pot.getPot(id);
+        for (uint16 i; i < p.periods; i++) {
+            _warpToPeriod(id, i);
+            _checkIn(id, alice, i);
+            _checkIn(id, bob, i);
+        }
+        _warpPastEnd(id);
+
+        // The fee rate was locked at 5% when the pot was created; carol's 10 USDC was forfeited.
+        assertEq(pot.collectableFee(id), 0.5e6);
+        assertGe(pot.claimable(id, alice), STAKE);
+        assertGe(pot.claimable(id, bob), STAKE);
+    }
+
     function test_RenounceOwnership_IsDisabled() public {
         vm.prank(owner);
         vm.expectRevert(PushPot.RenounceDisabled.selector);

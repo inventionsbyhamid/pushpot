@@ -9,46 +9,61 @@ Please report privately through GitHub's
 rather than a public issue. Include what you found, how to reproduce it and what an attacker
 could gain. We'll acknowledge reports within 48 hours.
 
-## Threat model
+## Where money can go
 
-### What the contract guarantees
+The contract has no admin withdrawal of any kind. USDC leaves it in exactly three ways:
 
-- Staked USDC can only leave the contract to the members of the pot it was staked in: on
-  `leave` before the start, or on `claim` after the end.
-- The rules of a pot are fixed when it is created, including the oracle that judges it and the
-  platform fee. The owner can't change them for a running pot.
-- The platform fee comes only out of forfeited stakes. It is never taken from a winner's own
-  stake or a refund, and there's no fee when everyone or nobody finishes. It is capped at 10% in
-  the contract.
-- The owner can:
-  - pause new pots and joins;
-  - set the oracle, fee and treasury for future pots;
-  - revoke an oracle key;
-  - change or remove the curator.
+| Function | Who receives it | How much |
+|---|---|---|
+| `leave` | the member leaving, before the pot starts | their own stake |
+| `claim` | the member claiming, after the pot ends | their share, or their stake back if nobody finished |
+| `collectFee` | the treasury, once per pot | 5% of forfeited stakes, never more than 10% |
 
-  It can't move funds, block claims, block leaving, or renounce ownership.
-- The curator can open official challenges. It doesn't stake or join them, and it has no access
-  to funds.
-- A revoked or absent oracle can't check anyone in. Pots then end without completers, and every
-  member gets their stake back.
+The contract never grants token allowances, makes no arbitrary calls, has no payable functions
+and isn't upgradeable. A test takes over every privileged role, including ownership itself, and
+checks that none of them can extract a single unit of a member's stake.
 
-### What you trust the operator for
+## Roles
+
+| Role | Held by | Can | Can't |
+|---|---|---|---|
+| Owner | the operator's hardware wallet | pause new pots and joins; set the oracle, fee and treasury for future pots; revoke an oracle; change the curator | move funds, change a running pot, block claims or leaving, renounce ownership |
+| Oracle | the server's hot key | check in a member for the current period | move funds, check anyone in for a closed period |
+| Curator | the server's hot key | open official challenges | stake, join, or touch funds |
+| Treasury | the operator's wallet | receive fees from finished pots | anything else |
+
+A pot keeps the oracle and fee that were active when it was created. The web app refuses to stake
+into any pot whose oracle isn't PushPot's, so even a stolen owner key couldn't trick players into
+pots judged by someone else. Safe isn't deployed on Arc yet; ownership transfers in two steps so
+it can move to a multisig later.
+
+## What you trust the operator for
 
 - **Fair attestation.** The oracle decides whether a workout happened. A dishonest or compromised
-  oracle could check in members who didn't do their reps, or ignore members who did. It can't
-  check anyone in for a closed period.
-- **Liveness.** If the server is down, nobody can check in.
+  oracle could check in members who didn't do their reps, or ignore members who did. That is the
+  main trust assumption, so the oracle key holds only a little gas money, lives only in the
+  server's environment, and can be revoked instantly.
+- **Liveness.** If the server is down, nobody can check in. Pots then end without completers and
+  everyone is refunded.
 
-### Known limitations
+## Known limitations
 
 - **Rep counts come from the user's device.** The server validates the telemetry and recounts
-  reps from the raw angle trace, but a determined attacker can forge a plausible trace. Private pots
-  are joined by invite link and never listed; only official challenges are public, and they
+  reps from the raw angle trace, but a determined attacker can forge a plausible trace. Private
+  pots are joined by invite link and never listed; only official challenges are public, and they
   carry small stakes.
 - **The contracts are unaudited.** Stakes are capped per member (`maxStake`, set at deploy).
   Private pots hold at most 50 members and official challenges at most 1,000.
-- **The owner is a single key.** Safe isn't deployed on Arc yet. Ownership transfers in two
-  steps, so it can move to a multisig later.
+
+## Incident response
+
+- **Oracle key leaked:** the owner calls `revokeOracle` with the old key. It can no longer check
+  anyone in, so its pots end with every member refunded. Then generate a new key, `setOracle` it
+  for new pots and update the server.
+- **Bug or abuse:** the owner calls `setPaused(true)`. New pots and joins stop; check ins, leaving
+  and claims keep working, so nobody's money is stuck.
+- **Treasury address unusable:** the owner points `setTreasury` at a new address; uncollected fees
+  follow it.
 
 ## Testing
 
@@ -57,10 +72,10 @@ The CI workflow runs on every push:
 - **Contract:**
   - Foundry unit tests;
   - fuzzing (5,000 runs);
-  - stateful invariant tests (256 runs × 500 calls);
+  - stateful invariant tests (256 runs × 500 calls), including random owner actions;
   - Slither.
 - **Server:** integration tests against Postgres, plus clippy with warnings denied.
-- **Web:** unit tests for the rep counter and telemetry.
+- **Web:** unit tests for the rep counter, telemetry and payout maths.
 
 ## Secrets
 
