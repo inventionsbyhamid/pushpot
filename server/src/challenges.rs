@@ -284,8 +284,10 @@ impl Template {
 const RETRY: Duration = Duration::from_secs(15);
 
 pub async fn run(state: AppState) {
+    // `maxStake` is immutable, so it's read from the contract once.
+    let mut max_stake = None;
     loop {
-        let wait = match curate(&state, Utc::now()).await {
+        let wait = match curate(&state, Utc::now(), &mut max_stake).await {
             Ok(true) => INTERVAL,
             Ok(false) => RETRY,
             Err(err) => {
@@ -298,13 +300,21 @@ pub async fn run(state: AppState) {
     }
 }
 
-/// Returns false when it couldn't run yet and should be retried soon.
-async fn curate(state: &AppState, now: DateTime<Utc>) -> Result<bool> {
+/// Returns false when it couldn't run yet and should be retried soon. Makes no RPC calls unless an
+/// instance is missing or stuck.
+async fn curate(
+    state: &AppState,
+    now: DateTime<Utc>,
+    max_stake: &mut Option<u128>,
+) -> Result<bool> {
     // On a fresh or restored database the indexer must see existing challenges first, or they'd
     // be opened a second time.
     if !state.indexer_ready.load(Ordering::Relaxed) {
         tracing::info!("waiting for the indexer to catch up before opening challenges");
         return Ok(false);
+    }
+    if !has_work(state, now).await? {
+        return Ok(true);
     }
     let ours = state.config.oracle_signer.address();
     let curator = state.chain.curator().await.context("reading curator")?;
@@ -312,7 +322,10 @@ async fn curate(state: &AppState, now: DateTime<Utc>) -> Result<bool> {
         tracing::warn!(%curator, oracle = %ours, "the oracle key isn't the curator; not opening challenges");
         return Ok(true);
     }
-    let max_stake = state.chain.max_stake().await.context("reading max stake")?;
+    let max_stake = match *max_stake {
+        Some(cached) => cached,
+        None => *max_stake.insert(state.chain.max_stake().await.context("reading max stake")?),
+    };
     let head = state
         .chain
         .provider
@@ -323,6 +336,28 @@ async fn curate(state: &AppState, now: DateTime<Utc>) -> Result<bool> {
     reconcile(state, ours, head).await?;
     open_missing(state, now, max_stake, head).await?;
     Ok(true)
+}
+
+/// Whether any upcoming instance is missing (after adopting ones already on chain) or a pending
+/// one needs reconciling. Database only.
+async fn has_work(state: &AppState, now: DateTime<Utc>) -> Result<bool> {
+    let stuck: bool = sqlx::query_scalar(
+        "select exists(select 1 from challenges
+         where state = 'pending' and created_at < now() - interval '2 minutes')",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    if stuck {
+        return Ok(true);
+    }
+    for template in CATALOG {
+        for start in template.upcoming(now) {
+            if !adopt_existing(&state.db, template, start, &template.title(start)).await? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Opens every upcoming instance that doesn't exist yet. `head` is a block no new transaction can
@@ -697,12 +732,25 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn makes_no_rpc_calls_when_every_challenge_is_open(db: PgPool) {
+        let oracle = Arc::new(FakeOracle::default());
+        let (state, rpc) = testing::state(db, oracle.clone());
+        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
+        let opened = oracle.challenge_titles().len();
+
+        // No responses are queued, so any RPC call would fail the pass.
+        assert!(curate(&state, now(), &mut None).await.unwrap());
+        assert_eq!(oracle.challenge_titles().len(), opened);
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[sqlx::test]
     async fn waits_for_the_indexer_before_opening_anything(db: PgPool) {
         let oracle = Arc::new(FakeOracle::default());
         let (state, rpc) = testing::state(db, oracle.clone());
         state.indexer_ready.store(false, Ordering::Relaxed);
 
-        assert!(!curate(&state, now()).await.unwrap());
+        assert!(!curate(&state, now(), &mut None).await.unwrap());
         assert!(oracle.challenge_titles().is_empty());
         assert!(rpc.read_q().is_empty(), "no RPC calls while waiting");
     }

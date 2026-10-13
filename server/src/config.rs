@@ -67,7 +67,7 @@ impl Config {
                 .context("ORACLE_PRIVATE_KEY is not a valid private key")?,
             web_dir: optional("WEB_DIR", "../web/dist").into(),
             indexer_interval: millis("INDEXER_INTERVAL_MS", "5000")?,
-            indexer_idle_interval: millis("INDEXER_IDLE_MS", "60000")?,
+            indexer_idle_interval: millis("INDEXER_IDLE_MS", "300000")?,
             curator_enabled: flag("CURATOR_ENABLED", true)?,
             fee_collector_enabled: flag("FEE_COLLECTOR_ENABLED", true)?,
         })

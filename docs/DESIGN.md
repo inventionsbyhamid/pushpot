@@ -130,9 +130,9 @@ everything the indexer needs.
   announcement only wakes it and can never skip or reorder a log.
 - If the node answering `eth_getLogs` hasn't seen an announced log yet, the cursor stays put and
   the read is retried shortly.
-- A safety poll runs every 60 seconds while the subscription is live (`INDEXER_IDLE_MS`) and
-  every 5 seconds while it's down (`INDEXER_INTERVAL_MS`). Idle, that is about 2,900 RPC calls
-  a day instead of one or two per block.
+- A safety poll runs every 5 minutes while the subscription is live (`INDEXER_IDLE_MS`) and
+  every 5 seconds while it's down (`INDEXER_INTERVAL_MS`). Idle, that is about 600 RPC calls a
+  day instead of one or two per block.
 - Reads cover at most 9,999 blocks (the RPC caps a query at 10k). The safety poll stays one
   block behind the head: behind a load balancer, the node answering `eth_getLogs` may not have
   the block another node reported as the head yet.
@@ -193,8 +193,9 @@ cohort anyone can join without an invite. Every instance starts at 00:00 UTC and
 | `thirty-day` | 30 Day Challenge | regular | 25 a day | the whole month | 5 USDC | the 1st | next 1 |
 | `club-52` | 52 Week Club | beast | 100 a week | 52 weeks | 10 USDC | first Monday of each month | next 1 |
 
-- The scheduler runs at startup and every 30 minutes, when `CURATOR_ENABLED` is on and the
-  contract's `curator` is the oracle key.
+- The scheduler runs at startup and every 30 minutes when `CURATOR_ENABLED` is on and the
+  contract's `curator` is the oracle key. Each pass checks the database first and only touches
+  the chain when an instance is missing or stuck.
 - Only starts more than an hour and less than 30 days away (the contract's `MAX_START_DELAY`)
   are opened. A template staked above the contract's `maxStake` is skipped with a warning.
 - Titles stay within 48 bytes: "Daily 50 · Oct 14", "Iron Week · Oct 19", "30 Day · November",
@@ -435,7 +436,7 @@ Configuration is through environment variables:
 | `BIND_ADDR` | optional |
 | `WEB_DIR` | optional |
 | `INDEXER_INTERVAL_MS` | optional, default `5000`; poll interval while the subscription is down |
-| `INDEXER_IDLE_MS` | optional, default `60000`; safety poll while it's live |
+| `INDEXER_IDLE_MS` | optional, default `300000`; safety poll while it's live |
 | `CURATOR_ENABLED` | optional, default `true`; opens official challenges |
 | `FEE_COLLECTOR_ENABLED` | optional, default `true`; collects finished pots' fees |
 
