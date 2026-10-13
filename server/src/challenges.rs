@@ -1,7 +1,7 @@
 //! Official challenges: a fixed catalog of templates that the server opens on a schedule from the
 //! curator key (the oracle key in deployment), so there is always a cohort anyone can join.
 
-use std::{iter::successors, time::Duration};
+use std::{iter::successors, sync::atomic::Ordering, time::Duration};
 
 use alloy::{
     primitives::{Address, B256},
@@ -280,23 +280,37 @@ impl Template {
     }
 }
 
+/// How soon to try again when the indexer hasn't caught up yet or a pass failed.
+const RETRY: Duration = Duration::from_secs(15);
+
 pub async fn run(state: AppState) {
-    let mut interval = tokio::time::interval(INTERVAL);
     loop {
-        interval.tick().await;
-        if let Err(err) = curate(&state, Utc::now()).await {
-            let error = redact_url(&format!("{err:#}"), &state.config.rpc_url);
-            tracing::warn!(%error, "opening challenges failed");
-        }
+        let wait = match curate(&state, Utc::now()).await {
+            Ok(true) => INTERVAL,
+            Ok(false) => RETRY,
+            Err(err) => {
+                let error = redact_url(&format!("{err:#}"), &state.config.rpc_url);
+                tracing::warn!(%error, "opening challenges failed");
+                RETRY
+            }
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 
-async fn curate(state: &AppState, now: DateTime<Utc>) -> Result<()> {
+/// Returns false when it couldn't run yet and should be retried soon.
+async fn curate(state: &AppState, now: DateTime<Utc>) -> Result<bool> {
+    // On a fresh or restored database the indexer must see existing challenges first, or they'd
+    // be opened a second time.
+    if !state.indexer_ready.load(Ordering::Relaxed) {
+        tracing::info!("waiting for the indexer to catch up before opening challenges");
+        return Ok(false);
+    }
     let ours = state.config.oracle_signer.address();
     let curator = state.chain.curator().await.context("reading curator")?;
     if curator != ours {
         tracing::warn!(%curator, oracle = %ours, "the oracle key isn't the curator; not opening challenges");
-        return Ok(());
+        return Ok(true);
     }
     let max_stake = state.chain.max_stake().await.context("reading max stake")?;
     let head = state
@@ -306,28 +320,9 @@ async fn curate(state: &AppState, now: DateTime<Utc>) -> Result<()> {
         .await
         .context("block number")?;
 
-    // On a fresh or restored database the indexer must see existing challenges first, or they'd
-    // be opened a second time.
-    if !indexer_caught_up(&state.db, head).await? {
-        tracing::info!(
-            head,
-            "waiting for the indexer to catch up before opening challenges"
-        );
-        return Ok(());
-    }
-
     reconcile(state, ours, head).await?;
-    open_missing(state, now, max_stake, head).await
-}
-
-/// Lag the indexer may have and still count as current; it trails the head by design.
-const INDEXER_SLACK_BLOCKS: u64 = 20;
-
-async fn indexer_caught_up(db: &PgPool, head: u64) -> Result<bool> {
-    let indexed: Option<i64> = sqlx::query_scalar("select last_block from indexer_state")
-        .fetch_optional(db)
-        .await?;
-    Ok(indexed.is_some_and(|block| block as u64 + INDEXER_SLACK_BLOCKS >= head))
+    open_missing(state, now, max_stake, head).await?;
+    Ok(true)
 }
 
 /// Opens every upcoming instance that doesn't exist yet. `head` is a block no new transaction can
@@ -702,14 +697,14 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn waits_for_the_indexer_on_a_fresh_database(db: PgPool) {
-        assert!(!indexer_caught_up(&db, 1_000).await.unwrap());
-        sqlx::query("insert into indexer_state (id, last_block) values (true, 990)")
-            .execute(&db)
-            .await
-            .unwrap();
-        assert!(indexer_caught_up(&db, 1_000).await.unwrap());
-        assert!(!indexer_caught_up(&db, 2_000).await.unwrap());
+    async fn waits_for_the_indexer_before_opening_anything(db: PgPool) {
+        let oracle = Arc::new(FakeOracle::default());
+        let (state, rpc) = testing::state(db, oracle.clone());
+        state.indexer_ready.store(false, Ordering::Relaxed);
+
+        assert!(!curate(&state, now()).await.unwrap());
+        assert!(oracle.challenge_titles().is_empty());
+        assert!(rpc.read_q().is_empty(), "no RPC calls while waiting");
     }
 
     #[sqlx::test]

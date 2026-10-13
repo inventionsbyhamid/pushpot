@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         workout_limiter: Arc::new(RateLimiter::new(20, Duration::from_secs(60))),
         event_streams: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
         challenge_cache: Arc::new(ChallengeCache::default()),
+        indexer_ready: Arc::default(),
         index_html: std::fs::read_to_string(config.web_dir.join("index.html"))
             .ok()
             .map(Into::into),

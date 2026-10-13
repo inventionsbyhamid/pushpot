@@ -119,6 +119,7 @@ pub async fn run(state: AppState) {
                     }
                     Pass::Done => {
                         lagging = 0;
+                        state.indexer_ready.store(true, Ordering::Relaxed);
                         if announced.is_empty() {
                             let interval = if live.load(Ordering::Relaxed) {
                                 state.config.indexer_idle_interval

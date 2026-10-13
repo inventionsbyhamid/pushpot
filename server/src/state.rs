@@ -25,6 +25,8 @@ pub struct AppState {
     pub challenge_cache: Arc<ChallengeCache>,
     /// The built `index.html`, used to render link previews. `None` when the web app isn't built.
     pub index_html: Option<Arc<str>>,
+    /// Set once the indexer has caught up with the chain after startup.
+    pub indexer_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

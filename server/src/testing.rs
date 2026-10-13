@@ -151,6 +151,7 @@ pub fn state(db: PgPool, oracle: Arc<FakeOracle>) -> (AppState, Asserter) {
         event_streams: Arc::new(Semaphore::new(10)),
         challenge_cache: Arc::new(ChallengeCache::default()),
         index_html: None,
+        indexer_ready: Arc::new(true.into()),
     };
     (state, rpc)
 }
