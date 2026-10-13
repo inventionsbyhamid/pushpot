@@ -544,6 +544,46 @@ contract PushPotTest is Test {
         pot.setOracle(alice);
     }
 
+    function test_Pause_BlocksCreateAndJoin() public {
+        uint256 id = _create();
+        vm.expectEmit(address(pot));
+        emit PushPot.PausedSet(true);
+        vm.prank(owner);
+        pot.setPaused(true);
+
+        PushPot.PotParams memory p = _params();
+        vm.prank(alice);
+        vm.expectRevert(PushPot.Paused.selector);
+        pot.createPot(p);
+
+        vm.prank(bob);
+        vm.expectRevert(PushPot.Paused.selector);
+        pot.join(id);
+    }
+
+    function test_Pause_KeepsExistingPotsWorking() public {
+        uint256 id = _create();
+        _join(id, bob);
+        _join(id, carol);
+        vm.prank(owner);
+        pot.setPaused(true);
+
+        vm.prank(carol);
+        pot.leave(id);
+
+        _completeAll(id, alice);
+        _warpPastEnd(id);
+        vm.prank(alice);
+        pot.claim(id);
+        assertEq(usdc.balanceOf(address(pot)), 0);
+    }
+
+    function test_SetPaused_OnlyOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pot.setPaused(true);
+    }
+
     // --- invariants ---
 
     function testFuzz_PayoutsConserveFunds(uint8 memberCount, uint64 completedMask, uint128 stake)

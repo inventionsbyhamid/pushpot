@@ -59,6 +59,7 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
     IERC20 public immutable usdc;
     uint128 public immutable maxStake;
     address public oracle;
+    bool public paused;
     uint256 public potCount;
 
     mapping(uint256 potId => Pot) private _pots;
@@ -86,8 +87,10 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
     );
     event Claimed(uint256 indexed potId, address indexed member, uint256 amount);
     event OracleUpdated(address indexed oracle);
+    event PausedSet(bool paused);
 
     error InvalidParams();
+    error Paused();
     error PotNotFound();
     error PotFull();
     error JoiningClosed();
@@ -115,8 +118,9 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         emit OracleUpdated(oracle_);
     }
 
-    function createPot(PotParams calldata params) external nonReentrant returns (uint256) {
-        return _createPot(params);
+    function createPot(PotParams calldata params) external nonReentrant returns (uint256 potId) {
+        potId = _createPot(params);
+        _collectStake(params.stake);
     }
 
     function createPotWithPermit(
@@ -125,21 +129,23 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         uint8 v,
         bytes32 r,
         bytes32 s
-    ) external nonReentrant returns (uint256) {
+    ) external nonReentrant returns (uint256 potId) {
+        potId = _createPot(params);
         _permit(params.stake, deadline, v, r, s);
-        return _createPot(params);
+        _collectStake(params.stake);
     }
 
     function join(uint256 potId) external nonReentrant {
-        _join(potId);
+        _collectStake(_join(potId));
     }
 
     function joinWithPermit(uint256 potId, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
         external
         nonReentrant
     {
-        _permit(_getPot(potId).stake, deadline, v, r, s);
-        _join(potId);
+        uint256 stake = _join(potId);
+        _permit(stake, deadline, v, r, s);
+        _collectStake(stake);
     }
 
     function leave(uint256 potId) external nonReentrant {
@@ -197,6 +203,13 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         usdc.safeTransfer(msg.sender, amount);
     }
 
+    /// @notice Stops new pots and joins. Existing pots keep running: check-ins, leaving and
+    /// claims are never blocked, so pausing can't lock anyone's stake.
+    function setPaused(bool paused_) external onlyOwner {
+        paused = paused_;
+        emit PausedSet(paused_);
+    }
+
     function setOracle(address oracle_) external onlyOwner {
         if (oracle_ == address(0)) revert InvalidParams();
         oracle = oracle_;
@@ -231,6 +244,7 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
     }
 
     function _createPot(PotParams calldata params) private returns (uint256 potId) {
+        if (paused) revert Paused();
         uint256 titleLength = bytes(params.title).length;
         if (
             params.stake == 0 || params.stake > maxStake || params.repsPerPeriod == 0
@@ -271,7 +285,8 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         _join(potId);
     }
 
-    function _join(uint256 potId) private {
+    function _join(uint256 potId) private returns (uint256 stake) {
+        if (paused) revert Paused();
         Pot storage pot = _getPot(potId);
         if (block.timestamp >= pot.startTime) revert JoiningClosed();
         if (pot.memberCount >= pot.maxMembers) revert PotFull();
@@ -282,11 +297,15 @@ contract PushPot is Ownable2Step, ReentrancyGuardTransient {
         pot.memberCount++;
 
         emit Joined(potId, msg.sender);
-        usdc.safeTransferFrom(msg.sender, address(this), pot.stake);
+        return pot.stake;
+    }
+
+    function _collectStake(uint256 stake) private {
+        usdc.safeTransferFrom(msg.sender, address(this), stake);
     }
 
     /// @dev A failed permit is ignored so a front-run signature can't block the call; the
-    /// transfer below still fails if there is no allowance.
+    /// stake transfer that follows still fails if there is no allowance.
     function _permit(uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) private {
         try IERC20Permit(address(usdc))
             .permit(msg.sender, address(this), value, deadline, v, r, s) {}

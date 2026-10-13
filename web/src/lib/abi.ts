@@ -255,7 +255,7 @@ export const pushPotAbi = [
     ],
     "outputs": [
       {
-        "name": "",
+        "name": "potId",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -331,7 +331,7 @@ export const pushPotAbi = [
     ],
     "outputs": [
       {
-        "name": "",
+        "name": "potId",
         "type": "uint256",
         "internalType": "uint256"
       }

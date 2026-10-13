@@ -11,8 +11,13 @@ remappings = [
   "forge-std/=lib/forge-std/src/",
 ]
 
+[profile.default.invariant]
+runs = 32
+depth = 100
+
 [profile.ci]
 fuzz = { runs = 5_000 }
+invariant = { runs = 256, depth = 500 }
 
 [rpc_endpoints]
 arc = "https://rpc.mainnet.arc.io"
