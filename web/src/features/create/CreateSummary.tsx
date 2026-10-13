@@ -47,10 +47,10 @@ export function CreateSummary({
       <dl className="space-y-1.5 border-t border-dashed border-line px-4 py-3 text-sm">
         <DetailRow term="Starts">
           {startsAt === null
-            ? "–"
+            ? "Pick a start time"
             : `${formatDateTime(startsAt)} (in ${formatDuration((startsAt - now) / 1000)})`}
         </DetailRow>
-        <DetailRow term="Ends">{endsAt === null ? "–" : formatDateTime(endsAt)}</DetailRow>
+        <DetailRow term="Ends">{endsAt === null ? "Not set" : formatDateTime(endsAt)}</DetailRow>
         <DetailRow term="Each player stakes">{formatUsdc(stake)}</DetailRow>
         <DetailRow term={`Pot with ${maxMembers} players`}>
           {formatUsdc(stake * BigInt(maxMembers))}

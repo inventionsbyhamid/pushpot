@@ -2,14 +2,14 @@ import type { SetupChecks } from "../../pose/setup";
 
 const CHECKS: { key: keyof SetupChecks; label: string }[] = [
   { key: "inFrame", label: "Head to feet in frame" },
-  { key: "sideOn", label: "Side-on" },
+  { key: "sideOn", label: "Sideways" },
   { key: "plank", label: "Plank, arms straight" },
 ];
 
 export function SetupGuide({ checks }: { checks: SetupChecks }) {
   const ready = CHECKS.every(({ key }) => checks[key]);
   return (
-    <div className="rounded-xl border border-line bg-ink/85 px-4 py-3 backdrop-blur-sm">
+    <div className="rounded-xl border border-line bg-ink/85 px-4 py-3">
       <p className={`font-display text-2xl leading-none font-extrabold uppercase ${ready ? "text-volt" : "text-chalk"}`}>
         {ready ? "Hold it…" : "Get in position"}
       </p>

@@ -28,20 +28,35 @@ export function visibilityOf(landmark: Landmark | undefined): number {
   return landmark?.visibility ?? 0;
 }
 
-/** Pairs of landmark indices forming the body skeleton (face and hands omitted). */
+/** Landmarks worth drawing: the nose, then everything from the shoulders down. */
+export const BODY_LANDMARKS: readonly number[] = [0, ...Array.from({ length: 22 }, (_, i) => 11 + i)];
+
+/** Pairs of landmark indices forming the body skeleton (face omitted). */
 export const BODY_CONNECTIONS: readonly (readonly [number, number])[] = [
   [11, 12],
   [11, 13],
   [13, 15],
+  [15, 17],
+  [15, 19],
+  [15, 21],
+  [17, 19],
   [12, 14],
   [14, 16],
+  [16, 18],
+  [16, 20],
+  [16, 22],
+  [18, 20],
   [11, 23],
   [12, 24],
   [23, 24],
   [23, 25],
   [25, 27],
+  [27, 29],
   [27, 31],
+  [29, 31],
   [24, 26],
   [26, 28],
+  [28, 30],
   [28, 32],
+  [30, 32],
 ];

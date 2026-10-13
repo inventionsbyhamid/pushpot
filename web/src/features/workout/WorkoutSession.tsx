@@ -1,20 +1,21 @@
 import { useEffect, useEffectEvent, useRef, useState, type JSX } from "react";
 import { Button } from "../../components/Button";
-import { POSE_MODEL, type Delegate } from "../../pose/landmarker";
+import { POSE_MODEL } from "../../pose/assets";
+import type { Delegate } from "../../pose/detector";
 import type { Cue, Phase } from "../../pose/repCounter";
 import type { SetupChecks } from "../../pose/setup";
 import { createWorkoutTracker } from "../../pose/tracker";
 import type { WorkoutResult } from "../../pose/types";
 import { CameraView } from "./CameraView";
-import { celebrate, createBeeper, createWakeLock, CUE_TEXT, isFault, pulse, themeColor } from "./feedback";
-import { DoneOverlay, ErrorPanel, IconButton, Scoreboard, StatusBanner } from "./Hud";
+import { celebrate, createBeeper, createWakeLock, CUE_TEXT, isFault, pulse } from "./feedback";
+import { DoneOverlay, ErrorPanel, IconButton, PerfHud, Scoreboard, StatusBanner } from "./Hud";
 import { CloseIcon, RotateIcon, SwitchCameraIcon } from "./icons";
-import { drawSkeleton, type OverlayColors } from "./overlay";
 import { SessionIntro } from "./SessionIntro";
 import { SetupGuide } from "./SetupGuide";
 import { useCamera, type CameraError } from "./useCamera";
 import { useMediaQuery } from "./useMediaQuery";
 import { usePoseLoop, type DetectedFrame } from "./usePoseLoop";
+import { usePoseOverlay } from "./usePoseOverlay";
 
 export interface WorkoutSessionProps {
   /** Reps to finish; omit for practice, where the user taps Finish. */
@@ -77,11 +78,12 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
   const [live, setLive] = useState(INITIAL_LIVE);
   const liveRef = useRef(INITIAL_LIVE);
   const sourceRef = useRef<{ delegate: Delegate; w: number; h: number }>({ delegate: "GPU", w: 0, h: 0 });
-  const colorsRef = useRef<OverlayColors | null>(null);
   const resultRef = useRef<WorkoutResult | null>(null);
   const camera = useCamera(videoRef);
   const { stop: stopCamera } = camera;
   const portrait = useMediaQuery("(orientation: portrait)");
+  const [debug] = useState(() => new URLSearchParams(window.location.search).has("debug"));
+  const overlay = usePoseOverlay(overlayRef, videoRef, camera.facing === "user", stage === "live");
 
   const finish = () => {
     if (resultRef.current) return;
@@ -102,19 +104,10 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
     sourceRef.current = { delegate, w, h };
     const update = tracker.push(now, landmarks ?? [], w, h);
 
-    const overlay = overlayRef.current;
-    if (overlay) {
-      if (overlay.width !== w || overlay.height !== h) {
-        overlay.width = w;
-        overlay.height = h;
-      }
-      colorsRef.current ??= {
-        valid: themeColor("volt", "#ccff2e"),
-        invalid: themeColor("mute", "#8f9891"),
-        joint: themeColor("ink", "#0c0f0d"),
-      };
-      drawSkeleton(overlay, landmarks, update.side, update.valid, colorsRef.current);
-    }
+    overlay.push(
+      { landmarks, time: now, width: w, height: h, side: update.side, valid: update.valid, elbow: update.elbow },
+      performance.now(),
+    );
 
     const reached = target !== undefined && update.count >= target;
     if (update.count > liveRef.current.count) {
@@ -191,7 +184,7 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
               </div>
             </div>
             {portrait && (
-              <p className="flex items-center gap-2 self-center rounded-full bg-ink/80 px-4 py-2 text-sm text-mute backdrop-blur-sm">
+              <p className="flex items-center gap-2 self-center rounded-full bg-ink/85 px-4 py-2 text-sm text-mute">
                 <RotateIcon />
                 Turn your phone sideways for a wider view
               </p>
@@ -211,7 +204,7 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
               ) : null}
             </div>
             <div className="flex w-full items-end justify-between gap-3">
-              <p className="text-xs text-mute">On-device · no video leaves your phone</p>
+              <p className="text-xs text-mute">Counted on your phone · no video leaves it</p>
               {target === undefined && stage === "live" && (
                 <Button variant="secondary" onClick={finish} className="shrink-0">
                   Finish
@@ -238,6 +231,7 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
           onExit={onExit}
         />
       )}
+      {debug && stage === "live" && <PerfHud stats={pose.stats} backend={pose.backend} videoRef={videoRef} />}
       {stage === "done" && target !== undefined && <DoneOverlay count={live.count} />}
     </div>
   );

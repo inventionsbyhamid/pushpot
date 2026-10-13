@@ -3,7 +3,7 @@ import type { RefObject } from "react";
 interface CameraViewProps {
   videoRef: RefObject<HTMLVideoElement | null>;
   overlayRef: RefObject<HTMLCanvasElement | null>;
-  /** Mirror the front camera so it reads like a mirror; landmarks stay in camera space. */
+  /** Mirror the front camera so it reads like a mirror. The overlay mirrors its own drawing. */
   mirrored: boolean;
 }
 
@@ -19,7 +19,7 @@ export function CameraView({ videoRef, overlayRef, mirrored }: CameraViewProps) 
         autoPlay
         className={`absolute inset-0 size-full object-contain ${flip}`}
       />
-      <canvas ref={overlayRef} className={`pointer-events-none absolute inset-0 size-full object-contain ${flip}`} />
+      <canvas ref={overlayRef} className="pointer-events-none absolute" />
     </div>
   );
 }

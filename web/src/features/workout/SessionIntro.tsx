@@ -3,7 +3,7 @@ import { CloseIcon } from "./icons";
 
 const TIPS = [
   { title: "Phone on the floor, landscape", detail: "Lean it against something about 2 m away." },
-  { title: "Side-on to the camera", detail: "Your body should run across the screen." },
+  { title: "Sideways to the camera", detail: "Your body should run across the screen." },
   { title: "Head to feet in frame", detail: "Hold a plank with straight arms to start counting." },
 ];
 
@@ -52,7 +52,7 @@ export function SessionIntro({ target, onStart, onExit }: SessionIntroProps) {
           <Button onClick={onStart} className="w-full">
             Start
           </Button>
-          <p className="text-center text-xs text-mute">On-device · no video leaves your phone</p>
+          <p className="text-center text-xs text-mute">Counted on your phone · no video leaves it</p>
         </div>
       </div>
     </div>
