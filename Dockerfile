@@ -17,6 +17,8 @@ RUN find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -nam
       -exec gzip -k -9 {} \; -exec brotli -k -q 11 {} \;
 
 FROM rust:1.99-bookworm AS server
+# The build host is shared; leave cores for other workloads.
+ENV CARGO_BUILD_JOBS=8
 WORKDIR /app
 COPY server/ ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
