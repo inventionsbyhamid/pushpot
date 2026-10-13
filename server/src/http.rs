@@ -23,7 +23,8 @@ const CONTENT_SECURITY_POLICY: &str = concat!(
     "style-src 'self' 'unsafe-inline'; ",
     "img-src 'self' data: blob: https:; ",
     "font-src 'self' data:; ",
-    "connect-src 'self' https://rpc.mainnet.arc.io https://rpc.testnet.arc.io ",
+    // Arc's public RPCs, which the web app falls back across.
+    "connect-src 'self' https://*.mainnet.arc.io https://*.testnet.arc.network https://rpc.testnet.arc.io ",
     "https://*.walletconnect.com wss://*.walletconnect.com ",
     "https://*.walletconnect.org wss://*.walletconnect.org https://*.web3modal.org; ",
     "frame-src https://verify.walletconnect.com https://verify.walletconnect.org; ",
