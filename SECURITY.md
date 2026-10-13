@@ -15,14 +15,20 @@ could gain. We'll acknowledge reports within 48 hours.
 
 - Staked USDC can only leave the contract to the members of the pot it was staked in: on
   `leave` before the start, or on `claim` after the end.
-- The rules of a pot are fixed when it is created, including the oracle that judges it. The
-  owner can't change them for a running pot.
+- The rules of a pot are fixed when it is created, including the oracle that judges it and the
+  platform fee. The owner can't change them for a running pot.
+- The platform fee comes only out of forfeited stakes. It is never taken from a winner's own
+  stake or a refund, and there's no fee when everyone or nobody finishes. It is capped at 10% in
+  the contract.
 - The owner can:
   - pause new pots and joins;
-  - set the oracle for future pots;
-  - revoke an oracle key.
+  - set the oracle, fee and treasury for future pots;
+  - revoke an oracle key;
+  - change or remove the curator.
 
   It can't move funds, block claims, block leaving, or renounce ownership.
+- The curator can open official challenges. It doesn't stake or join them, and it has no access
+  to funds.
 - A revoked or absent oracle can't check anyone in. Pots then end without completers, and every
   member gets their stake back.
 

@@ -40,6 +40,13 @@ phone camera ─▶ MediaPipe pose (on-device) ─▶ rep counter ─▶ telemet
 4. **Payout.** Once the challenge ends, members who checked in every period claim an equal share
    of the whole pot. If nobody made it, everyone gets their stake back.
 
+Official challenges are always open: daily, weekly, weekend, monthly and a 52-week club. Anyone
+can join them. Friends can also start private pots and share an invite link.
+
+PushPot keeps 5% of forfeited stakes, and only those. It's never taken from a winner's own
+stake, and there's no fee when everyone or nobody finishes. The fee is locked into each pot when
+it's created and capped at 10% on-chain.
+
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design, API and security notes.
 
 ## Trust model
