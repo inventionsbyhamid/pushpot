@@ -7,7 +7,6 @@ export const CUE_TEXT: Record<Cue, string> = {
   hips_sag: "Hips sagging",
   hips_pike: "Hips too high",
   move_into_frame: "Move into frame",
-  turn_sideways: "Turn sideways",
   get_in_plank: "Get into a plank",
 };
 

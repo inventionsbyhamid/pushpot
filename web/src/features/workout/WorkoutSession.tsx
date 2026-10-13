@@ -3,7 +3,7 @@ import { Button } from "../../components/Button";
 import { POSE_MODEL } from "../../pose/assets";
 import type { Delegate } from "../../pose/detector";
 import type { Cue, Phase } from "../../pose/repCounter";
-import type { SetupChecks } from "../../pose/setup";
+import type { SetupChecks, View } from "../../pose/setup";
 import { createWorkoutTracker } from "../../pose/tracker";
 import type { WorkoutResult } from "../../pose/types";
 import { CameraView } from "./CameraView";
@@ -33,13 +33,15 @@ interface LiveState {
   phase: Phase;
   cue: Cue | null;
   checks: SetupChecks;
+  view: View;
 }
 
 const INITIAL_LIVE: LiveState = {
   count: 0,
   phase: "setup",
   cue: null,
-  checks: { inFrame: false, sideOn: false, plank: false },
+  checks: { inFrame: false, plank: false },
+  view: "side",
 };
 
 const CELEBRATION_MS = 1800;
@@ -59,8 +61,8 @@ function sameLive(a: LiveState, b: LiveState): boolean {
     a.phase === b.phase &&
     a.cue === b.cue &&
     a.checks.inFrame === b.checks.inFrame &&
-    a.checks.sideOn === b.checks.sideOn &&
-    a.checks.plank === b.checks.plank
+    a.checks.plank === b.checks.plank &&
+    a.view === b.view
   );
 }
 
@@ -105,7 +107,16 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
     const update = tracker.push(now, landmarks ?? [], w, h);
 
     overlay.push(
-      { landmarks, time: now, width: w, height: h, side: update.side, valid: update.valid, elbow: update.elbow },
+      {
+        landmarks,
+        time: now,
+        width: w,
+        height: h,
+        side: update.side,
+        view: update.view,
+        valid: update.valid,
+        elbow: update.elbow,
+      },
       performance.now(),
     );
 
@@ -114,7 +125,13 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
       beeper.beep(reached);
       pulse();
     }
-    const next: LiveState = { count: update.count, phase: update.phase, cue: update.cue, checks: update.checks };
+    const next: LiveState = {
+      count: update.count,
+      phase: update.phase,
+      cue: update.cue,
+      checks: update.checks,
+      view: update.view,
+    };
     if (!sameLive(next, liveRef.current)) {
       liveRef.current = next;
       setLive(next);
@@ -183,10 +200,11 @@ export function WorkoutSession({ target, workoutId, onComplete, onExit }: Workou
                 )}
               </div>
             </div>
-            {portrait && (
+            {/* Side on, a body lying across an upright phone rarely fits; face on, upright is fine. */}
+            {portrait && live.view === "side" && !live.checks.inFrame && live.phase === "setup" && (
               <p className="flex items-center gap-2 self-center rounded-full bg-ink/85 px-4 py-2 text-sm text-mute">
                 <RotateIcon />
-                Turn your phone sideways for a wider view
+                From the side? Lay your phone in landscape to fit head to feet
               </p>
             )}
           </div>

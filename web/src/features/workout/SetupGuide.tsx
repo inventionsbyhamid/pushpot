@@ -1,8 +1,7 @@
 import type { SetupChecks } from "../../pose/setup";
 
 const CHECKS: { key: keyof SetupChecks; label: string }[] = [
-  { key: "inFrame", label: "Head to feet in frame" },
-  { key: "sideOn", label: "Sideways" },
+  { key: "inFrame", label: "In frame" },
   { key: "plank", label: "Plank, arms straight" },
 ];
 

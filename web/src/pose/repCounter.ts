@@ -9,7 +9,7 @@ import {
   type Landmark,
   type Side,
 } from "./landmarks";
-import { checkFraming, FRAME_MARGIN, type SetupChecks } from "./setup";
+import { FRAME_MARGIN, isFramed, nextView, shoulderSpread, type SetupChecks, type View } from "./setup";
 import type { RepSummary } from "./types";
 
 export type Phase = "setup" | "up" | "down" | "lost";
@@ -20,7 +20,6 @@ export type Cue =
   | "hips_sag"
   | "hips_pike"
   | "move_into_frame"
-  | "turn_sideways"
   | "get_in_plank";
 
 export interface PoseFrame {
@@ -36,12 +35,15 @@ export interface CounterUpdate {
   count: number;
   phase: Phase;
   cue: Cue | null;
-  /** Smoothed elbow angle used for counting; held through invalid frames. */
+  /** Smoothed elbow angle used for counting; held through invalid frames. Face on, it is the angle
+   * the shoulders' drop implies. */
   elbow: number | null;
-  /** Smoothed shoulder–hip–ankle angle; held through invalid frames. */
+  /** Smoothed shoulder–hip–ankle angle; held through invalid frames. Face on, where the hips are
+   * hidden, it reads as straight. */
   body: number | null;
   valid: boolean;
   side: Side;
+  view: View;
   /** Mean visibility (0–1) of the landmarks used this frame. */
   vis: number;
   checks: SetupChecks;
@@ -102,18 +104,29 @@ const REBOUND_ANGLE = 130;
 const REDROP_ANGLE = 120;
 const STALE_DESCENT_MS = 4000;
 const CUE_HOLD_MS = 2000;
+const VIEW_EMA_ALPHA = 0.2;
+// Face on, the top of a rep is learnt from the starting plank and only ever rises after it, so
+// shallower tops can't lower the bar for depth.
+const REACH_ALPHA = 0.1;
+const STRAIGHT = 180;
 
 const SIDE_JOINTS: readonly Joint[] = ["shoulder", "elbow", "wrist", "hip", "ankle"];
+const FRONT_JOINTS: readonly Joint[] = ["shoulder", "elbow", "wrist"];
+const MISSING: Landmark = { x: 0, y: 0, z: 0, visibility: 0 };
 
 interface Measurement {
   valid: boolean;
-  elbow: number;
+  /** Side on, the elbow angle. Face on, the shoulders' height above the hands in shoulder widths. */
+  arm: number;
+  /** The more bent of the elbow angles the camera sees, to check for straight arms. */
+  straight: number;
   body: number;
-  torso: number;
+  /** Torso length side on, shoulder width face on: the yardstick for hand drift. */
+  scale: number;
   wrist: Point;
   hipOffset: number;
   vis: number;
-  framing: Omit<SetupChecks, "plank">;
+  inFrame: boolean;
 }
 
 interface Cycle {
@@ -130,14 +143,17 @@ interface Cycle {
   frames: number;
   validFrames: number;
   visSum: number;
-  torsoSum: number;
+  scaleSum: number;
   wristAnchor: Point;
   wristDrift: number;
 }
 
-function measure(pose: readonly Landmark[], side: Side, width: number, height: number): Measurement {
-  const at = (joint: Joint): Landmark => pose[jointIndex(side, joint)] ?? { x: 0, y: 0, z: 0, visibility: 0 };
-  const usable = (l: Landmark) => visibilityOf(l) >= MIN_VISIBILITY && isInFrame(l, FRAME_MARGIN);
+function usable(landmark: Landmark): boolean {
+  return visibilityOf(landmark) >= MIN_VISIBILITY && isInFrame(landmark, FRAME_MARGIN);
+}
+
+function measureSide(pose: readonly Landmark[], side: Side, width: number, height: number): Measurement {
+  const at = (joint: Joint): Landmark => pose[jointIndex(side, joint)] ?? MISSING;
   const px = (l: Landmark) => toPixels(l, width, height);
 
   const shoulder = at("shoulder");
@@ -147,17 +163,52 @@ function measure(pose: readonly Landmark[], side: Side, width: number, height: n
   const ankle = at("ankle");
   const foot = usable(ankle) ? ankle : at("knee");
   const used = [shoulder, elbow, wrist, hip, foot];
+  const angle = angleAt(px(shoulder), px(elbow), px(wrist));
 
   return {
     valid: [shoulder, hip, elbow, wrist].every(usable),
-    elbow: angleAt(px(shoulder), px(elbow), px(wrist)),
+    arm: angle,
+    straight: angle,
     body: angleAt(px(shoulder), px(hip), px(foot)),
-    torso: distance(px(shoulder), px(hip)),
+    scale: distance(px(shoulder), px(hip)),
     wrist: px(wrist),
     hipOffset: offsetFromLine(px(hip), px(shoulder), px(foot)),
     vis: used.reduce((sum, l) => sum + visibilityOf(l), 0) / used.length,
-    framing: checkFraming(pose, side, width, height),
+    inFrame: isFramed(pose, "side", side),
   };
+}
+
+function measureFront(pose: readonly Landmark[], width: number, height: number): Measurement {
+  const at = (side: Side, joint: Joint) => pose[jointIndex(side, joint)] ?? MISSING;
+  const px = (side: Side, joint: Joint) => toPixels(at(side, joint), width, height);
+  const used = FRONT_JOINTS.flatMap((joint) => [at("left", joint), at("right", joint)]);
+  const midpoint = (joint: Joint): Point => {
+    const [a, b] = [px("left", joint), px("right", joint)];
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  };
+  const span = distance(px("left", "shoulder"), px("right", "shoulder"));
+  const bend = (side: Side) => angleAt(px(side, "shoulder"), px(side, "elbow"), px(side, "wrist"));
+
+  return {
+    valid: used.every(usable),
+    arm: span > 0 ? (midpoint("wrist").y - midpoint("shoulder").y) / span : 0,
+    straight: Math.min(bend("left"), bend("right")),
+    body: STRAIGHT,
+    scale: span,
+    wrist: midpoint("wrist"),
+    hipOffset: 0,
+    vis: used.reduce((sum, l) => sum + visibilityOf(l), 0) / used.length,
+    inFrame: isFramed(pose, "front", "left"),
+  };
+}
+
+/**
+ * The elbow angle implied by the shoulders' height over the hands, taking the forearms as
+ * upright: the full height of a plank is straight arms, half of it a right angle.
+ */
+function impliedElbow(height: number, reach: number): number {
+  const share = reach > 0 ? clamp(height / reach, 0, 1) : 1;
+  return (Math.acos(1 - 2 * share) * 180) / Math.PI;
 }
 
 function sideVisibility(pose: readonly Landmark[], side: Side): number {
@@ -165,21 +216,26 @@ function sideVisibility(pose: readonly Landmark[], side: Side): number {
 }
 
 /**
- * Counts pushups from a stream of side-view pose frames. Pure: no DOM, no clock of its own.
+ * Counts pushups from a stream of pose frames, seen side on or face on. Pure: no DOM, no clock
+ * of its own.
  *
- * Phases: `setup` until a side-on plank is held, then `up` ⇄ `down` with hysteresis on the
- * smoothed elbow angle. A rep is counted on the way back up only if it passes every form and
- * timing check; otherwise a cue explains why. Frames with unreliable landmarks never change
- * state, and a long run of them reports `lost`.
+ * Phases: `setup` until a plank is held, which also settles the view, then `up` ⇄ `down` with
+ * hysteresis on the smoothed elbow angle. A rep is counted on the way back up only if it passes
+ * every form and timing check; otherwise a cue explains why. Frames with unreliable landmarks
+ * never change state, and a long run of them reports `lost`.
  */
 export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounter {
   const cfg: CounterConfig = { ...DEFAULT_CONFIG, ...config };
   const elbowSignal = new SmoothedSignal(ANGLE_FILTER);
   const bodySignal = new SmoothedSignal(ANGLE_FILTER);
   const sideScore: Record<Side, Ema> = { left: new Ema(SIDE_EMA_ALPHA), right: new Ema(SIDE_EMA_ALPHA) };
+  const spreadScore = new Ema(VIEW_EMA_ALPHA);
   const reps: RepSummary[] = [];
   const tops: number[] = [];
 
+  let view: View | null = null;
+  /** Face on, the shoulders' height over the hands at the top of a rep, in shoulder widths. */
+  let reach: number | null = null;
   let side: Side | null = null;
   let switchStreak = 0;
   let phase: Exclude<Phase, "lost"> = "setup";
@@ -214,8 +270,25 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
     if (switchStreak < SIDE_SWITCH_FRAMES) return side;
 
     switchStreak = 0;
-    resetSignals();
+    // Face on, both arms count, so the angle carries on undisturbed.
+    if (view !== "front") resetSignals();
     return otherSide(side);
+  }
+
+  function settleView(pose: readonly Landmark[], width: number, height: number): void {
+    const next = nextView(view, spreadScore.push(shoulderSpread(pose, width, height)));
+    if (next === view) return;
+    view = next;
+    reach = null;
+    resetSignals();
+  }
+
+  function followReach(height: number): void {
+    reach = reach === null ? height : reach + REACH_ALPHA * (height - reach);
+  }
+
+  function inPlank(m: Measurement, e: number, b: number): boolean {
+    return view === "front" ? m.straight >= cfg.plankAngle : e >= cfg.plankAngle && b >= cfg.plankAngle;
   }
 
   function startCycle(t: number, m: Measurement): Cycle {
@@ -232,7 +305,7 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
       frames: 0,
       validFrames: 0,
       visSum: 0,
-      torsoSum: 0,
+      scaleSum: 0,
       wristAnchor: m.wrist,
       wristDrift: 0,
     };
@@ -242,7 +315,7 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
     c.frames += 1;
     c.validFrames += 1;
     c.visSum += m.vis;
-    c.torsoSum += m.torso;
+    c.scaleSum += m.scale;
     c.wristDrift = Math.max(c.wristDrift, distance(m.wrist, c.wristAnchor));
     if (e < c.minElbow) {
       c.minElbow = e;
@@ -265,7 +338,7 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
       (lastRepEnd === null || t - lastRepEnd >= MIN_REP_GAP_MS) &&
       c.validFrames >= MIN_REP_FRAMES &&
       c.validFrames / c.frames >= MIN_VALID_RATIO &&
-      c.wristDrift <= MAX_WRIST_DRIFT * (c.torsoSum / c.validFrames);
+      c.wristDrift <= MAX_WRIST_DRIFT * (c.scaleSum / c.validFrames);
     if (!counts) return;
 
     reps.push({
@@ -282,7 +355,8 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
 
     tops.push(c.top);
     if (tops.length > TOP_HISTORY) tops.shift();
-    if (reps.length >= ADAPT_AFTER_REPS) {
+    // Face on, the angle at the top is relative to the user's own lockout already.
+    if (view !== "front" && reps.length >= ADAPT_AFTER_REPS) {
       upAngle = clamp(median(tops) - TOP_MARGIN, cfg.upAngleRange[0], cfg.upAngleRange[1]);
     }
   }
@@ -292,7 +366,8 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
     upStreak = e >= upAngle ? upStreak + 1 : 0;
 
     if (phase === "setup") {
-      const ready = m.framing.inFrame && m.framing.sideOn && e >= cfg.plankAngle && b >= cfg.plankAngle;
+      const ready = m.inFrame && inPlank(m, e, b);
+      if (ready && view === "front") followReach(m.arm);
       setupSince = ready ? (setupSince ?? t) : null;
       if (setupSince !== null && t - setupSince >= SETUP_HOLD_MS) {
         phase = "up";
@@ -307,6 +382,7 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
       if (!cycle) {
         if (e >= upAngle) {
           top = Math.max(top, e);
+          if (view === "front" && reach !== null && m.arm > reach) followReach(m.arm);
           return;
         }
         cycle = startCycle(t, m);
@@ -336,6 +412,7 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
       phase = "setup";
       setupSince = null;
       cycle = null;
+      reach = null;
       return;
     }
     if (upStreak >= CONFIRM_FRAMES) {
@@ -357,7 +434,6 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
 
   function setupCue(checks: SetupChecks): Cue | null {
     if (!checks.inFrame) return "move_into_frame";
-    if (!checks.sideOn) return "turn_sideways";
     if (!checks.plank) return "get_in_plank";
     return null;
   }
@@ -367,8 +443,12 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
     lastValidAt ??= t;
 
     const pose = landmarks.length >= POSE_LANDMARK_COUNT ? landmarks : null;
-    if (pose) side = selectSide(pose);
-    const m = pose && side ? measure(pose, side, width, height) : null;
+    if (pose) {
+      side = selectSide(pose);
+      if (phase === "setup") settleView(pose, width, height);
+    }
+    let m: Measurement | null = null;
+    if (pose && side) m = view === "front" ? measureFront(pose, width, height) : measureSide(pose, side, width, height);
     const valid = m?.valid ?? false;
 
     if (m && valid) {
@@ -377,7 +457,7 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
         resetSignals();
       }
       lastValidAt = t;
-      elbow = elbowSignal.push(m.elbow, t);
+      elbow = elbowSignal.push(view === "front" ? impliedElbow(m.arm, reach ?? m.arm) : m.arm, t);
       body = bodySignal.push(m.body, t);
       step(t, m, elbow, body);
     } else {
@@ -392,9 +472,8 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
     }
 
     const checks: SetupChecks = {
-      inFrame: valid && (m?.framing.inFrame ?? false),
-      sideOn: m?.framing.sideOn ?? false,
-      plank: valid && elbow !== null && body !== null && elbow >= cfg.plankAngle && body >= cfg.plankAngle,
+      inFrame: valid && (m?.inFrame ?? false),
+      plank: valid && m !== null && elbow !== null && body !== null && inPlank(m, elbow, body),
     };
     const stateCue = lost ? "move_into_frame" : phase === "setup" ? setupCue(checks) : null;
     const eventCue = event && t - event.at < CUE_HOLD_MS ? event.cue : null;
@@ -407,6 +486,7 @@ export function createRepCounter(config: Partial<CounterConfig> = {}): RepCounte
       body,
       valid,
       side: side ?? "left",
+      view: view ?? "side",
       vis: m?.vis ?? 0,
       checks,
     };

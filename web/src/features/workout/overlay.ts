@@ -9,6 +9,7 @@ import {
   type Landmark,
   type Side,
 } from "../../pose/landmarks";
+import type { View } from "../../pose/setup";
 
 // Tuned on recorded landmarks: about a third less jitter at rest with no visible lag in motion.
 // Positions are filtered in units of the frame's shorter side.
@@ -44,6 +45,7 @@ export interface PoseSample {
   width: number;
   height: number;
   side: Side;
+  view: View;
   valid: boolean;
   /** Elbow angle the counter is using, in degrees. */
   elbow: number | null;
@@ -123,6 +125,16 @@ export function createPoseOverlay(): PoseOverlay {
     };
   };
   const tracked = { left: highlight("left"), right: highlight("right") };
+  // Face on, the counter reads both arms and the shoulders between them.
+  const front = (() => {
+    const arms = (["left", "right"] as const).flatMap((s) => [
+      [point(jointIndex(s, "shoulder")), point(jointIndex(s, "elbow"))] as const,
+      [point(jointIndex(s, "elbow")), point(jointIndex(s, "wrist"))] as const,
+    ]);
+    const bridge = [point(jointIndex("left", "shoulder")), point(jointIndex("right", "shoulder"))] as const;
+    const joints = new Set(arms.flat());
+    return { bones: [...arms, bridge], joints: [...joints], others: points.filter((p) => !joints.has(p)) };
+  })();
 
   let shown = false;
   let lostAt: number | null = null;
@@ -130,6 +142,7 @@ export function createPoseOverlay(): PoseOverlay {
   let lastPushAt: number | null = null;
   let span = 33;
   let side: Side = "left";
+  let facing: View = "side";
   let valid = false;
   let elbow: number | null = null;
   let dirty = true;
@@ -182,6 +195,7 @@ export function createPoseOverlay(): PoseOverlay {
     shown = true;
     lostAt = null;
     side = sample.side;
+    facing = sample.view;
     valid = sample.valid;
     elbow = sample.elbow;
   }
@@ -214,7 +228,7 @@ export function createPoseOverlay(): PoseOverlay {
     }
 
     const { colors } = view;
-    const highlighted = tracked[side];
+    const highlighted = facing === "front" ? front : tracked[side];
     const accent = valid ? colors.active : colors.inactive;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
@@ -237,7 +251,10 @@ export function createPoseOverlay(): PoseOverlay {
     ctx.lineWidth = unit * 0.5;
     drawJoints(ctx, highlighted.joints, unit * 1.25, fade);
 
-    if (valid && elbow !== null) drawElbowAngle(ctx, highlighted.arm, elbow, unit, accent, colors.ink, fade);
+    // Face on, the angle comes from the shoulders' drop rather than any one arm, so it isn't drawn.
+    if (valid && elbow !== null && facing === "side") {
+      drawElbowAngle(ctx, tracked[side].arm, elbow, unit, accent, colors.ink, fade);
+    }
     ctx.globalAlpha = 1;
   }
 

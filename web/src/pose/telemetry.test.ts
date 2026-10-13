@@ -25,7 +25,8 @@ describe("createTelemetryRecorder", () => {
     const recorder = createTelemetryRecorder();
     const times = [1000, 1033, 1066, 1600, 1633];
     for (const t of times) recorder.record({ t, elbow: 200, body: 170.4, vis: 0.9 });
-    const telemetry = recorder.build({ workoutId: "w", model: "m", delegate: "CPU", video: { w: 640, h: 480 }, reps: [] });
+    const meta = { workoutId: "w", view: "side", model: "m", delegate: "CPU", video: { w: 640, h: 480 }, reps: [] } as const;
+    const telemetry = recorder.build(meta);
 
     const dt = decodeBase64(telemetry.trace.dt);
     expect(Array.from(dt)).toEqual([0, 33, 33, MAX_FRAME_DT_MS, 33]);

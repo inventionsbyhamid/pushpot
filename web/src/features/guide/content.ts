@@ -44,10 +44,13 @@ export const DONTS: Tip[] = [
 
 export const CAMERA_TIPS: Tip[] = [
   {
-    title: "Phone on the floor, landscape",
-    detail: "Prop it up about 2 m (6 to 7 ft) to your side.",
+    title: "Phone on the floor",
+    detail: "Prop it up in front of you, about 1 m (3 ft) past your hands. Or 2 m (6 to 7 ft) to your side, in landscape.",
   },
-  { title: "Your whole body in frame", detail: "Head to heels, sideways to the camera." },
+  {
+    title: "Stay in frame",
+    detail: "From the front: head, shoulders and both hands. From the side: head to heels, and it checks your hips too.",
+  },
   { title: "Light on you", detail: "Good light, and no bright window behind you." },
   { title: "Fitted clothes", detail: "Baggy tops hide your elbows and hips." },
   { title: "Front camera", detail: "So you can see yourself and the count." },

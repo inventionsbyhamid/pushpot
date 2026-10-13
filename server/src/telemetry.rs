@@ -40,9 +40,22 @@ const MAX_FLAT_SHARE: f64 = 0.98;
 pub struct Telemetry {
     pub v: u8,
     pub workout_id: Uuid,
+    /// Clients from before front view support only counted side on.
+    #[serde(default)]
+    pub view: View,
     pub duration_ms: f64,
     pub reps: Vec<Rep>,
     pub trace: Trace,
+}
+
+/// Where the camera stood. From the front the hips are hidden, so the body line goes unchecked
+/// and the client reports the elbow angle implied by how far the shoulders drop.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum View {
+    #[default]
+    Side,
+    Front,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,11 +158,12 @@ pub fn validate(t: &Telemetry, ctx: &Context) -> Result<Verdict, Rejection> {
         return Err(Rejection::TooFast);
     }
 
-    check_reps(&t.reps, t.duration_ms)?;
+    let body_line = t.view == View::Side;
+    check_reps(&t.reps, t.duration_ms, body_line)?;
 
     let trace = decode_trace(&t.trace)?;
-    check_trace(&trace, t.reps.len(), t.duration_ms)?;
-    check_reps_in_trace(&t.reps, &trace)?;
+    check_trace(&trace, t.reps.len(), t.duration_ms, body_line)?;
+    check_reps_in_trace(&t.reps, &trace, body_line)?;
 
     // The two counters use slightly different thresholds, so allow one rep of disagreement.
     let recount = recount(&trace.elbow, &trace.dt);
@@ -168,7 +182,7 @@ pub fn validate(t: &Telemetry, ctx: &Context) -> Result<Verdict, Rejection> {
     })
 }
 
-fn check_reps(reps: &[Rep], duration_ms: f64) -> Result<(), Rejection> {
+fn check_reps(reps: &[Rep], duration_ms: f64, body_line: bool) -> Result<(), Rejection> {
     let mut previous_end = 0.0;
     for (i, rep) in reps.iter().enumerate() {
         let n = i + 1;
@@ -198,7 +212,7 @@ fn check_reps(reps: &[Rep], duration_ms: f64) -> Result<(), Rejection> {
         {
             return Err(Rejection::RepRange(n));
         }
-        if rep.min_body < f64::from(MIN_BODY_LINE) {
+        if body_line && rep.min_body < f64::from(MIN_BODY_LINE) {
             return Err(Rejection::RepForm(n));
         }
         if rep.vis < MIN_REP_VISIBILITY {
@@ -261,7 +275,12 @@ fn decode_trace(trace: &Trace) -> Result<DecodedTrace, Rejection> {
     })
 }
 
-fn check_trace(trace: &DecodedTrace, reps: usize, duration_ms: f64) -> Result<(), Rejection> {
+fn check_trace(
+    trace: &DecodedTrace,
+    reps: usize,
+    duration_ms: f64,
+    body_line: bool,
+) -> Result<(), Rejection> {
     let frames = trace.dt.len();
     if frames < reps * 5 || frames == 0 {
         return Err(Rejection::LowFrameRate);
@@ -285,7 +304,7 @@ fn check_trace(trace: &DecodedTrace, reps: usize, duration_ms: f64) -> Result<()
     }
 
     let flat = flat_value(&trace.dt).is_some()
-        || flat_value(&trace.body).is_some()
+        || (body_line && flat_value(&trace.body).is_some())
         // A confident pose model can pin visibility at the top of the scale.
         || flat_value(&trace.vis).is_some_and(|v| v != u8::MAX);
     if flat {
@@ -322,7 +341,11 @@ fn elbow_jumps(elbow: &[u8], dt: &[u8]) -> usize {
 
 /// Every reported rep must be visible in the trace: a bottom close to the reported depth, a
 /// straight body throughout, and a lockout before it ends.
-fn check_reps_in_trace(reps: &[Rep], trace: &DecodedTrace) -> Result<(), Rejection> {
+fn check_reps_in_trace(
+    reps: &[Rep],
+    trace: &DecodedTrace,
+    body_line: bool,
+) -> Result<(), Rejection> {
     let times = trace.times();
     let window = |from: f64, to: f64| -> Range<usize> {
         times.partition_point(|&t| t < from)..times.partition_point(|&t| t <= to)
@@ -336,7 +359,7 @@ fn check_reps_in_trace(reps: &[Rep], trace: &DecodedTrace) -> Result<(), Rejecti
         if (f64::from(lowest) - rep.min_elbow).abs() > DEPTH_TOLERANCE {
             return Err(Rejection::RecountMismatch);
         }
-        if trace.body[frames].iter().any(|&deg| deg < MIN_BODY_LINE) {
+        if body_line && trace.body[frames].iter().any(|&deg| deg < MIN_BODY_LINE) {
             return Err(Rejection::RepForm(i + 1));
         }
         if !trace.elbow[window(rep.bottom, rep.end)]
@@ -405,7 +428,7 @@ pub mod fixtures {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use uuid::Uuid;
 
-    use super::{Rep, Telemetry, Trace};
+    use super::{Rep, Telemetry, Trace, View};
 
     const TOP: f64 = 165.0;
 
@@ -553,6 +576,7 @@ pub mod fixtures {
             Telemetry {
                 v: 1,
                 workout_id,
+                view: View::Side,
                 duration_ms: t,
                 reps: summaries,
                 trace: Trace {
@@ -618,6 +642,7 @@ pub mod fixtures {
         Telemetry {
             v: 1,
             workout_id,
+            view: View::Side,
             duration_ms: t,
             reps: summaries,
             trace: Trace {
@@ -748,6 +773,50 @@ mod tests {
         };
         let verdict = validate(&telemetry, &context).unwrap();
         assert_eq!(verdict.recount, 10);
+    }
+
+    /// What a front view client sends: no body line, so the channel holds a constant 180°.
+    fn from_the_front(mut s: Session) -> Session {
+        let frames = channel(&s, |t| &t.body).len();
+        s.telemetry.view = View::Front;
+        s.telemetry.trace.body = STANDARD.encode(vec![180u8; frames]);
+        for rep in &mut s.telemetry.reps {
+            rep.min_body = 180.0;
+        }
+        s
+    }
+
+    #[test]
+    fn accepts_front_view_sessions_without_a_body_line() {
+        let s = from_the_front(session(10, 1_200.0, 82.0, 165, true));
+        let verdict = validate(&s.telemetry, &ctx(&s, 10)).unwrap();
+        assert_eq!(verdict.recount, 10);
+
+        // The same flat body line from a side view is a forgery.
+        let mut side = s;
+        side.telemetry.view = View::Side;
+        assert_eq!(
+            validate(&side.telemetry, &ctx(&side, 10)),
+            Err(Rejection::Synthetic)
+        );
+    }
+
+    #[test]
+    fn front_view_reps_still_need_depth() {
+        let s = from_the_front(session(10, 1_200.0, 130.0, 165, true));
+        assert!(matches!(
+            validate(&s.telemetry, &ctx(&s, 10)),
+            Err(Rejection::RepRange(_))
+        ));
+    }
+
+    #[test]
+    fn telemetry_without_a_view_is_from_the_side() {
+        let s = session(1, 1_200.0, 82.0, 165, true);
+        let mut json = serde_json::to_value(&s.telemetry).unwrap();
+        json.as_object_mut().unwrap().remove("view");
+        let parsed: Telemetry = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.view, View::Side);
     }
 
     #[test]

@@ -166,3 +166,55 @@ export function synthesize(options: SyntheticOptions): PoseFrame[] {
   }
   return frames;
 }
+
+export interface FrontOptions {
+  durationMs: number;
+  /** The elbow angle the shoulders' height implies, taking the forearms as upright. */
+  elbow: Curve;
+  fps?: number;
+  width?: number;
+  height?: number;
+  /** Uniform noise (±pixels) on every landmark. */
+  jitterPx?: number;
+  seed?: number;
+}
+
+/** A plank facing the camera: shoulders over the hands, sinking towards them as the elbows flare. */
+export function synthesizeFront(options: FrontOptions): PoseFrame[] {
+  const { durationMs, elbow, fps = 30, width = 640, height = 480, jitterPx = 0, seed = 1 } = options;
+  const random = mulberry32(seed);
+  const noise = (amount: number) => (random() * 2 - 1) * amount;
+  const span = 0.28 * width;
+  const rise = 0.45 * height;
+  const floor = 0.85 * height;
+  const center = width / 2;
+  const frames: PoseFrame[] = [];
+
+  for (let i = 0; i * (1000 / fps) <= durationMs; i++) {
+    const t = i * (1000 / fps);
+    const share = (1 - Math.cos(elbow(t) * RAD)) / 2;
+    const shoulderY = floor - rise * share;
+    const flare = 0.05 * span + 0.6 * span * (1 - share);
+    const landmarks: Landmark[] = Array.from({ length: POSE_LANDMARK_COUNT }, () => ({
+      x: center / width,
+      y: (shoulderY - 0.1 * height) / height,
+      z: 0,
+      visibility: 0.95,
+    }));
+    const place = (index: number, x: number, y: number, visibility = 0.95) => {
+      landmarks[index] = { x: (x + noise(jitterPx)) / width, y: (y + noise(jitterPx)) / height, z: 0, visibility };
+    };
+    for (const [side, direction] of [["left", 1], ["right", -1]] as const) {
+      const shoulderX = center + (direction * span) / 2;
+      place(jointIndex(side, "shoulder"), shoulderX, shoulderY);
+      place(jointIndex(side, "elbow"), shoulderX + direction * flare, (shoulderY + floor) / 2);
+      place(jointIndex(side, "wrist"), shoulderX + direction * 0.1 * span, floor);
+      // The hips and legs hide behind the shoulders.
+      for (const joint of ["hip", "knee", "ankle", "foot"] as const) {
+        place(jointIndex(side, joint), center + direction * 0.3 * span, shoulderY + 0.02 * height, 0.1);
+      }
+    }
+    frames.push({ t, landmarks, width, height });
+  }
+  return frames;
+}

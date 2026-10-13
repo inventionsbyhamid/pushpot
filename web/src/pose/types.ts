@@ -11,6 +11,8 @@ export interface RepSummary {
 export interface Telemetry {
   v: 1;
   workout_id: string;
+  /** Front: no body line, and the elbow channel is the angle the shoulders' drop implies. */
+  view: "side" | "front";
   model: string;
   delegate: "GPU" | "CPU";
   video: { w: number; h: number };

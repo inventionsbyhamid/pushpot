@@ -3,9 +3,9 @@ import { WorkoutPrep } from "../guide/WorkoutPrep";
 import { CloseIcon } from "./icons";
 
 const TIPS = [
-  { title: "Phone on the floor, landscape", detail: "Lean it against something about 2 m away." },
-  { title: "Sideways to the camera", detail: "Your body should run across the screen." },
-  { title: "Head to feet in frame", detail: "Hold a plank with straight arms to start counting." },
+  { title: "Phone on the floor", detail: "In front of you past your hands, or about 2 m to your side." },
+  { title: "Stay in frame", detail: "Shoulders and both hands from the front, head to feet from the side." },
+  { title: "Hold a plank to start", detail: "Straight arms for a moment and counting begins." },
 ];
 
 interface SessionIntroProps {

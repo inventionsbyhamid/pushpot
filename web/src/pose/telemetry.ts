@@ -15,6 +15,7 @@ export interface TelemetrySample {
 
 export interface TelemetryMeta {
   workoutId: string;
+  view: Telemetry["view"];
   model: string;
   delegate: Telemetry["delegate"];
   video: Telemetry["video"];
@@ -51,12 +52,13 @@ export function createTelemetryRecorder(): TelemetryRecorder {
       return dt.length;
     },
 
-    build({ workoutId, model, delegate, video, reps }) {
+    build({ workoutId, view, model, delegate, video, reps }) {
       const t0 = origin ?? 0;
       const since = (t: number) => Math.max(0, Math.round(t - t0));
       return {
         v: 1,
         workout_id: workoutId,
+        view,
         model,
         delegate,
         video,

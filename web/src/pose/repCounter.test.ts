@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createRepCounter, type PoseFrame } from "./repCounter";
-import { hold, ramp, reps, sequence, synthesize } from "./synthetic";
+import { hold, ramp, reps, sequence, synthesize, synthesizeFront } from "./synthetic";
 
 function run(frames: PoseFrame[]) {
   const counter = createRepCounter();
@@ -21,6 +21,7 @@ describe("createRepCounter", () => {
 
     expect(result.count).toBe(10);
     expect(result.reps).toHaveLength(10);
+    expect(result.updates.at(-1)?.view).toBe("side");
     for (const rep of result.reps) {
       expect(rep.start).toBeLessThan(rep.bottom);
       expect(rep.bottom).toBeLessThan(rep.end);
@@ -158,5 +159,36 @@ describe("createRepCounter", () => {
 
     expect(result.count).toBe(0);
     expect(result.updates.at(-1)?.phase).toBe("up");
+  });
+});
+
+describe("createRepCounter face on", () => {
+  it("counts clean reps from the shoulders' drop", () => {
+    const { curve, durationMs } = sequence(hold(170, 1000), reps(8, 1200, 80, 170), hold(170, 1000));
+    const result = run(synthesizeFront({ durationMs, elbow: curve, jitterPx: 1.5, seed: 5 }));
+
+    expect(result.updates.at(-1)?.view).toBe("front");
+    expect(result.count).toBe(8);
+    for (const rep of result.reps) {
+      expect(rep.min_elbow).toBeLessThanOrEqual(110);
+      expect(rep.max_elbow).toBeGreaterThanOrEqual(140);
+      expect(rep.min_body).toBe(180);
+    }
+  });
+
+  it("does not count shallow reps and cues to go lower", () => {
+    const { curve, durationMs } = sequence(hold(170, 1000), reps(5, 1200, 125, 170), hold(170, 1000));
+    const result = run(synthesizeFront({ durationMs, elbow: curve }));
+
+    expect(result.count).toBe(0);
+    expect(result.cues).toContain("go_lower");
+  });
+
+  it("waits for straight arms before counting", () => {
+    const { curve, durationMs } = sequence(hold(100, 2000), reps(3, 1200, 80, 100));
+    const result = run(synthesizeFront({ durationMs, elbow: curve }));
+
+    expect(result.phases).toEqual(new Set(["setup"]));
+    expect(result.cues).toContain("get_in_plank");
   });
 });

@@ -265,6 +265,7 @@ The client sends one object per workout:
 {
   "v": 1,
   "workout_id": "uuid",
+  "view": "side",
   "model": "pose_landmarker_lite",
   "delegate": "GPU",
   "video": { "w": 640, "h": 480 },
@@ -281,6 +282,8 @@ The client sends one object per workout:
 Field notes:
 
 - Rep times are milliseconds since counting started. Angles are in degrees.
+- `view` is `side` or `front`, and `side` when absent. From the front, `elbow` is the angle the
+  shoulders' drop implies and `body` is a constant 180.
 - `trace` holds one sample per processed frame:
   - `dt`: milliseconds since the previous frame (0 for the first), capped at 255. The workout
     clock advances by exactly these intervals, so `Σdt` equals `duration_ms`;
@@ -296,7 +299,7 @@ The server rejects a workout when any of these fail:
   - no overlap with the previous rep, and rep ends at least 400 ms apart;
   - duration 400–8000 ms;
   - min elbow ≤ 115°, max ≥ 140°, swing ≥ 30°;
-  - min body line ≥ 130°;
+  - min body line ≥ 130° (side view only);
   - visibility ≥ 0.4.
 - **Trace.**
   - channels have equal lengths, with at least 5 frames per rep;
@@ -304,8 +307,8 @@ The server rejects a workout when any of these fail:
   - median frame rate ≥ 10 fps;
   - mean visibility ≥ 0.5.
 - **Reps in the trace.** Within each rep's time window, the trace's lowest elbow angle is within
-  8° of `min_elbow`, the body line never drops below 130°, and the elbow locks out (≥ 140°)
-  between the bottom and the end.
+  8° of `min_elbow`, the body line never drops below 130° (side view), and the elbow locks out
+  (≥ 140°) between the bottom and the end.
 - **Recount.** The server recounts reps from `trace.elbow` with an independent hysteresis
   counter (down ≤ 115°, up ≥ 140°, at least 250 ms below 140°). The result must reach
   `reps_target` and be at least the number of reported reps minus one. The 250 ms is shorter
@@ -343,29 +346,40 @@ with the `pose_landmarker_lite` model.
 - Frames are driven by `requestVideoFrameCallback` on 640×480 front-camera video.
 - The skeleton overlay is drawn on a separate 2D canvas.
 
+**Views.** The camera can stand in front of the user or to their side. Shoulder width ÷ arm
+length tells them apart: from 0.45 up is the front, 0.35 and under is the side, and in between
+the view stays as it was. The view settles during setup and holds while counting.
+
+- *Side:* the elbow angle and the shoulder, hip and ankle line are measured directly.
+- *Front:* the hips hide behind the shoulders, so there is no body line. The counter measures
+  the shoulders' height above the hands in shoulder widths, which doesn't depend on distance.
+  The starting plank sets the full height; it only rises afterwards. Taking the forearms as
+  upright, a share `s` of that height implies an elbow angle of `acos(1 − 2s)`: full height is
+  180°, half is 90°. Everything after that, server checks included, works on that angle.
+
 **Setup check.** Before counting starts, the app checks:
 
-- the near-side shoulder, elbow, wrist, hip and ankle have visibility ≥ 0.6 and are inside the
-  frame;
-- the body is side-on: shoulder spread ÷ torso length < 0.8;
+- the joints the view needs have visibility ≥ 0.6 and are inside the frame. From the side: the
+  near shoulder, elbow, wrist, hip and ankle, or the knee when the feet are out of shot. From
+  the front: both shoulders, elbows and wrists;
 - the user is in a plank with arms extended for 0.5 s.
 
 **Rep counter.** A pure, unit-tested module:
 
 - *Side selection:* uses the more visible side, with hysteresis.
 - *Smoothing:* a median-of-3 filter, then a One Euro filter (min cutoff 1.0 Hz, β 0.02).
-- *Frame gating:* a frame counts only if shoulder, hip, elbow and wrist visibility are ≥ 0.5.
+- *Frame gating:* a frame counts only if the joints the view reads have visibility ≥ 0.5.
 - *Down:* elbow ≤ 110° for two frames. A side-on camera reads the bottom a little shallow, so
   this is a chest close to the floor; the guide still coaches 90°.
-- *Up:* elbow ≥ 140° for two frames, adapting after three reps to 12° under the user's own
-  top, between 140° and 155°. The server checks against 5° to 10° looser limits, because one
+- *Up:* elbow ≥ 140° for two frames. From the side it adapts after three reps to 12° under the
+  user's own top, between 140° and 155°. The server checks against 5° to 10° looser limits, because one
   failed rep rejects the whole workout.
 - *A rep counts only if:*
   - the cycle is ≥ 500 ms;
   - ≥ 500 ms have passed since the last rep;
   - ≥ 5 valid frames, at ≥ 70% valid;
-  - min body line ≥ 135°;
-  - wrist drift ≤ 0.25 × torso length.
+  - min body line ≥ 135° (side view);
+  - wrist drift ≤ 0.25 × torso length from the side, or shoulder width from the front.
 - *Feedback:* partial reps produce "go lower", "lock out", "hips sagging" and "move into frame".
 
 **Feel.**
