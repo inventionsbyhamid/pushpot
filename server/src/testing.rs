@@ -4,7 +4,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -23,6 +23,7 @@ use crate::{
     chain::{
         Chain,
         IPushPot::PotParams,
+        MAX_LOG_RANGE,
         oracle::{
             CheckInReceipt, CheckInRequest, CollectedFee, CreatedChallenge, OracleError,
             OracleFuture, OracleSender,
@@ -139,6 +140,7 @@ pub fn state(db: PgPool, oracle: Arc<FakeOracle>) -> (AppState, Asserter) {
         contract: Address::ZERO,
         chain_id: 5042,
         deploy_block: 0,
+        log_range: Arc::new(AtomicU64::new(MAX_LOG_RANGE)),
     };
     let state = AppState {
         db,

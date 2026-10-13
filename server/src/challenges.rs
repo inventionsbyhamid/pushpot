@@ -22,7 +22,6 @@ use sqlx::PgPool;
 use crate::{
     chain::{
         IPushPot::{self, PotParams},
-        indexer::MAX_RANGE,
         oracle::OracleError,
         redact_url,
     },
@@ -535,22 +534,14 @@ async fn created_by(
     from: u64,
     to: u64,
 ) -> Result<Vec<CreatedPot>> {
+    let filter = Filter::new()
+        .address(state.chain.contract)
+        .event_signature(IPushPot::PotCreated::SIGNATURE_HASH)
+        .topic2(creator.into_word());
     let mut pots = Vec::new();
     let mut start = from;
     while start <= to {
-        let end = to.min(start + MAX_RANGE - 1);
-        let filter = Filter::new()
-            .address(state.chain.contract)
-            .event_signature(IPushPot::PotCreated::SIGNATURE_HASH)
-            .topic2(creator.into_word())
-            .from_block(start)
-            .to_block(end);
-        let logs = state
-            .chain
-            .provider
-            .get_logs(&filter)
-            .await
-            .context("get logs")?;
+        let (logs, end) = state.chain.logs(&filter, start, to).await?;
         for log in logs {
             let Ok(created) = log.log_decode::<IPushPot::PotCreated>() else {
                 continue;

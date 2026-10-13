@@ -1,15 +1,20 @@
 pub mod indexer;
 pub mod oracle;
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use alloy::{
     contract::Error as ContractError,
     primitives::{Address, B256, Bytes, U256, eip191_hash_message},
     providers::{DynProvider, Provider, ProviderBuilder},
-    rpc::types::TransactionRequest,
+    rpc::types::{Filter, Log, TransactionRequest},
     sol,
     sol_types::SolCall,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use url::{Position, Url};
 
 use crate::config::Config;
@@ -100,12 +105,18 @@ sol! {
 
 const ERC1271_MAGIC: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 
+/// Blocks per `eth_getLogs` query. Most providers allow this many; free plans allow far fewer,
+/// which `Chain::logs` learns from their errors.
+pub const MAX_LOG_RANGE: u64 = 9_999;
+
 #[derive(Clone)]
 pub struct Chain {
     pub provider: DynProvider,
     pub contract: Address,
     pub chain_id: u64,
     pub deploy_block: u64,
+    /// The widest `eth_getLogs` range, in blocks, the provider is believed to accept.
+    pub log_range: Arc<AtomicU64>,
 }
 
 impl Chain {
@@ -129,7 +140,31 @@ impl Chain {
             contract: config.contract,
             chain_id,
             deploy_block: config.deploy_block,
+            log_range: Arc::new(AtomicU64::new(MAX_LOG_RANGE)),
         })
+    }
+
+    /// Reads logs matching `filter` from `from` towards `to` and returns them with the last block
+    /// they cover. A provider that refuses the range as too wide is asked for ever narrower ones,
+    /// and the width that worked is kept for later queries.
+    pub async fn logs(&self, filter: &Filter, from: u64, to: u64) -> Result<(Vec<Log>, u64)> {
+        let mut to = to.min(from + self.log_range.load(Ordering::Relaxed) - 1);
+        loop {
+            let query = filter.clone().from_block(from).to_block(to);
+            match self.provider.get_logs(&query).await {
+                Ok(logs) => return Ok((logs, to)),
+                Err(err) if to > from && err.to_string().to_ascii_lowercase().contains("range") => {
+                    let narrower = ((to - from + 1) / 10).max(1);
+                    self.log_range.store(narrower, Ordering::Relaxed);
+                    tracing::warn!(
+                        blocks = narrower,
+                        "the RPC limits eth_getLogs ranges; reading in smaller steps"
+                    );
+                    to = from + narrower - 1;
+                }
+                Err(err) => return Err(err).context("get logs"),
+            }
+        }
     }
 
     fn pushpot(&self) -> IPushPot::IPushPotInstance<&DynProvider> {
@@ -235,6 +270,7 @@ mod tests {
             contract: Address::repeat_byte(0xcc),
             chain_id: 5042,
             deploy_block: 0,
+            log_range: Arc::new(AtomicU64::new(MAX_LOG_RANGE)),
         }
     }
 

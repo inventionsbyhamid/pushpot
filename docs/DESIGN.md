@@ -124,20 +124,22 @@ everything the indexer needs.
 
 **Indexer.** The indexer is the single writer for on-chain state.
 
-- It keeps RPC use low because free endpoints are rate limited. A WebSocket subscription to the
-  contract's logs (`ARC_WS_URL`, derived from `ARC_RPC_URL` by default) announces activity as it
-  lands. The indexer then reads the logs with `eth_getLogs` up to the announced block, so the
-  announcement only wakes it and can never skip or reorder a log.
-- If the node answering `eth_getLogs` hasn't seen an announced log yet, the cursor stays put and
-  the read is retried shortly.
-- A safety poll runs every 5 minutes while the subscription is live (`INDEXER_IDLE_MS`) and
-  every 5 seconds while it's down (`INDEXER_INTERVAL_MS`). Idle, that is about 600 RPC calls a
-  day instead of one or two per block.
-- Reads cover at most 9,999 blocks (the RPC caps a query at 10k). The safety poll stays one
+- It doesn't poll, because free endpoints are rate limited. A WebSocket subscription to the
+  contract's logs (`ARC_WS_URL`, derived from `ARC_RPC_URL` by default) delivers each log as it
+  lands, and the indexer applies it as delivered.
+- `eth_getLogs` only fills gaps: from the stored cursor at startup, 2 s after the subscription
+  (re)connects, so every block the read stops short of is one the subscription delivers, and
+  every 5 seconds while it is down (`INDEXER_INTERVAL_MS`).
+- While the subscription is up, the cursor moves every 5 minutes (`INDEXER_IDLE_MS`) to the
+  head seen 5 minutes earlier: by then every log up to it has been delivered. That costs one
+  `eth_blockNumber`, about 300 calls a day idle, and keeps a restart's catch up short.
+- Reads cover at most 9,999 blocks. Free plans allow fewer (Alchemy's: 10), so a refused range
+  is retried ten times narrower until it is accepted, and that width is kept. Reads stay one
   block behind the head: behind a load balancer, the node answering `eth_getLogs` may not have
   the block another node reported as the head yet.
-- Each batch is applied in one database transaction together with the `last_block` cursor, so
-  every log is applied exactly once.
+- Applying a log twice is harmless: every write is an upsert or a no op when repeated, and
+  repeats come in block order. Read batches move the `last_block` cursor in the same
+  transaction; delivered logs at or below it are skipped.
 - A log that can never be stored (undecodable, or data Postgres rejects) is logged and skipped
   rather than retried forever, which would stall every join and check-in after it. Titles are
   stripped of control characters. RPC and connection errors retry the whole batch, and 15
@@ -461,7 +463,7 @@ Configuration is through environment variables:
 | `BIND_ADDR` | optional |
 | `WEB_DIR` | optional |
 | `INDEXER_INTERVAL_MS` | optional, default `5000`; poll interval while the subscription is down |
-| `INDEXER_IDLE_MS` | optional, default `300000`; safety poll while it's live |
+| `INDEXER_IDLE_MS` | optional, default `300000`; how often the cursor moves while it's live |
 | `CURATOR_ENABLED` | optional, default `true`; opens official challenges |
 | `FEE_COLLECTOR_ENABLED` | optional, default `true`; collects finished pots' fees |
 
