@@ -1,0 +1,11 @@
+.git
+.env
+**/.env
+**/node_modules
+web/dist
+web/public/mediapipe
+server/target
+contracts/out
+contracts/cache
+contracts/lib
+docs
