@@ -15,7 +15,7 @@ done
 
 staged=$(git diff --cached --no-color -U0)
 secrets=$(cat .env server/.env web/.env.local contracts/.env 2>/dev/null |
-  grep -E '^[A-Z0-9_]*(KEY|SECRET|TOKEN|PASSWORD)[A-Z0-9_]*=' | cut -d= -f2- || true)
+  grep -E '^[A-Z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|MNEMONIC)[A-Z0-9_]*=' | cut -d= -f2- | tr -d '"' || true)
 
 IFS='
 '
