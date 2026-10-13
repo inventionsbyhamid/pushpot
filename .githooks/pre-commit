@@ -6,7 +6,7 @@ set -eu
 for file in $(git diff --cached --name-only --diff-filter=ACMR); do
   case "$(basename "$file")" in
     .env.example) ;;
-    .env | .env.* | *.pem | *.key | wallets*.json)
+    .env | .env.* | *.pem | *.key | wallets*.json | mainnet.json)
       echo "pre-commit: refusing to commit $file" >&2
       exit 1
       ;;
