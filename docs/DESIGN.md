@@ -178,11 +178,12 @@ everything the indexer needs.
   complete again.
 - Both endpoints are rate-limited to 20 requests a minute per address.
 
-**Official challenges.** The server opens challenges from a fixed catalog, so there is always a
-cohort anyone can join without an invite. Every instance starts at 00:00 UTC and takes up to
-1,000 members.
+**Official challenges.** A fixed catalog schedules challenges, so there is always a cohort anyone
+can join without an invite. Every instance starts at 00:00 UTC and takes up to 1,000 members.
+An instance goes on chain only when its first player taps Join, so nobody pays gas for
+challenges nobody plays.
 
-| Key | Name | Tier | Reps | Length | Stake | Starts | Kept open |
+| Key | Name | Tier | Reps | Length | Stake | Starts | On offer |
 |---|---|---|---|---|---|---|---|
 | `daily-20` | Daily 20 | rookie | 20 | 1 day | 1 USDC | every day | next 2 |
 | `daily-50` | Daily 50 | regular | 50 | 1 day | 2 USDC | every day | next 2 |
@@ -193,21 +194,25 @@ cohort anyone can join without an invite. Every instance starts at 00:00 UTC and
 | `thirty-day` | 30 Day Challenge | regular | 25 a day | the whole month | 5 USDC | the 1st | next 1 |
 | `club-52` | 52 Week Club | beast | 100 a week | 52 weeks | 10 USDC | first Monday of each month | next 1 |
 
-- The scheduler runs at startup and every 30 minutes when `CURATOR_ENABLED` is on and the
-  contract's `curator` is the oracle key. Each pass checks the database first and only touches
-  the chain when an instance is missing or stuck.
-- Only starts more than an hour and less than 30 days away (the contract's `MAX_START_DELAY`)
-  are opened. A template staked above the contract's `maxStake` is skipped with a warning.
+- `GET /api/challenges` lists every instance on offer. Until one is opened it carries only its
+  plan, computed from the catalog. `POST /api/challenges/open` puts an instance on chain and
+  returns its pot id; the web app then shows that pot's join sheet.
+- Opening needs `CURATOR_ENABLED`, the contract's `curator` set to the oracle key, and an
+  indexer that has caught up once since startup, so a restored database never opens an
+  instance twice. An instance already on chain is adopted instead.
+- Only starts more than 15 minutes and less than 30 days away (the contract's
+  `MAX_START_DELAY`) are on offer. A template staked above the contract's `maxStake` is refused
+  with a warning.
 - Titles stay within 48 bytes: "Daily 50 · Oct 14", "Iron Week · Oct 19", "30 Day · November",
   "52 Week Club · Nov 2026".
 - Each instance is claimed as a `pending` row in `challenges`, keyed by template and start,
-  before `createChallenge` goes out through the oracle task. The new pot's id comes from the
-  receipt's `PotCreated` log. A refused transaction frees the row so the next run tries again;
-  an unconfirmed one stays `pending`.
-- A `pending` row older than 2 minutes is reconciled against the curator's `PotCreated` logs
-  since the block recorded with it. If the pot is there, the row is completed; if not, the row
-  is released and the instance opened again. A crash or restart therefore never opens an
-  instance twice.
+  before `createChallenge` goes out through the oracle task, so concurrent requests wait for the
+  same pot. The new pot's id comes from the receipt's `PotCreated` log. A refused transaction
+  frees the row so the next request tries again; an unconfirmed one stays `pending`.
+- Every 2 minutes the server checks the database for a `pending` row older than 2 minutes and
+  reconciles it against the curator's `PotCreated` logs since the block recorded with it. If the
+  pot is there, the row is completed; if not, the row is released so the next Join opens it
+  again. A crash or restart therefore never opens an instance twice.
 
 **Fees.** Each pot keeps the fee rate it was created with, taken only from forfeited stakes.
 When `FEE_COLLECTOR_ENABLED` is on, every 30 minutes the server looks for pots that stopped
@@ -227,6 +232,7 @@ All JSON uses snake_case. Amounts are in USDC base units (6 decimals) as integer
 | `GET /api/me` | `{address}` or `401` |
 | `GET /api/pots` | the caller's pots, `{pots: Pot[]}`, or `401`. Private pots are invite-only, so there is no public listing. |
 | `GET /api/challenges` | `{challenges: Challenge[]}`: official challenges that haven't ended, soonest first. No sign-in; cached for 5 s. |
+| `POST /api/challenges/open {key, start_time}` | `{pot_id}`; `422` if that instance isn't on offer, `503` while warming up, `502` if the chain refused. No sign-in; rate-limited per IP. |
 | `GET /api/pots/:id` | `{pot: Pot, members: Member[]}` |
 | `GET /api/pots/:id/events` | SSE: `joined`, `left`, `checked_in`, `claimed`; `404` for an unknown pot, `503` while 2,000 streams are open |
 | `POST /api/workouts {pot_id}` | `{workout_id, period, reps_target, period_ends_at}`; `409` if the period is checked in or a check-in is in flight |
@@ -240,7 +246,9 @@ Pot       = {id, title, creator, stake, reps_per_period, periods, period_seconds
              status: "upcoming" | "active" | "ended", current_period: number | null,
              official: boolean, fee_bps: number}
 Member    = {address, checked_in: number[], completed, out, claimed_amount: number | null}
-Challenge = {pot: Pot,
+Challenge = {pot: Pot | null,
+             plan: {title, stake, reps_per_period, periods, period_seconds,
+                    start_time, end_time, max_members},
              template: {key, name, tagline,
                         cadence: "daily" | "weekly" | "weekend" | "monthly" | "yearly",
                         tier: "rookie" | "regular" | "beast"}}

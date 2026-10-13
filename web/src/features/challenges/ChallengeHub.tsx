@@ -86,21 +86,22 @@ interface CadencePanelProps {
 function CadencePanel({ cadence, challenges, now, joined }: CadencePanelProps) {
   const timed = challenges
     .filter((c) => c.template.cadence === cadence)
-    .map((challenge) => ({ challenge, clock: potClock(challenge.pot, now) }));
+    .map((challenge) => ({ challenge, clock: potClock(challenge.plan, now) }));
   // Phases come from the clock, so a challenge moves along the moment it starts or ends.
   const open = timed.filter((c) => c.clock.phase === "upcoming");
-  const running = timed.filter((c) => c.clock.phase === "active");
+  // One nobody opened before its start has nobody in it.
+  const running = timed.filter((c) => c.clock.phase === "active" && c.challenge.pot);
   const schedule = cadences.find((c) => c.id === cadence)?.schedule;
 
   const cards = (items: typeof timed, offset = 0) => (
     <ul className="space-y-3">
       {items.map(({ challenge, clock }, i) => (
         <ChallengeCard
-          key={challenge.pot.id}
+          key={`${challenge.template.key}@${challenge.plan.start_time}`}
           challenge={challenge}
           clock={clock}
           now={now}
-          joined={joined.has(challenge.pot.id)}
+          joined={!!challenge.pot && joined.has(challenge.pot.id)}
           index={offset + i}
         />
       ))}

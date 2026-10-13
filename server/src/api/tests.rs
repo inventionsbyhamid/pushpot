@@ -842,11 +842,16 @@ async fn lists_challenges_that_have_not_ended(db: PgPool) {
     let challenges = body["challenges"].as_array().unwrap();
     let ids: Vec<i64> = challenges
         .iter()
-        .map(|c| c["pot"]["id"].as_i64().unwrap())
+        .filter_map(|c| c["pot"]["id"].as_i64())
         .collect();
     assert_eq!(ids, [10, 11]);
+    // Everything else on offer comes from the catalog, with no pot until someone opens it.
+    let planned: Vec<&Value> = challenges.iter().filter(|c| c["pot"].is_null()).collect();
+    assert!(!planned.is_empty());
+    assert!(planned.iter().all(|c| c["plan"]["start_time"].is_string()));
+    let by_id = |id: i64| challenges.iter().find(|c| c["pot"]["id"] == id).unwrap();
     assert_eq!(
-        challenges[0]["template"],
+        by_id(10)["template"],
         json!({
             "key": "daily-20",
             "cadence": "daily",
@@ -855,9 +860,10 @@ async fn lists_challenges_that_have_not_ended(db: PgPool) {
             "tagline": crate::challenges::template("daily-20").unwrap().tagline,
         })
     );
-    assert_eq!(challenges[0]["pot"]["status"], "active");
-    assert_eq!(challenges[1]["template"]["cadence"], "weekly");
-    assert_eq!(challenges[1]["pot"]["status"], "upcoming");
+    assert_eq!(by_id(10)["pot"]["status"], "active");
+    assert_eq!(by_id(10)["plan"]["title"], by_id(10)["pot"]["title"]);
+    assert_eq!(by_id(11)["template"]["cadence"], "weekly");
+    assert_eq!(by_id(11)["pot"]["status"], "upcoming");
 
     let (status, detail, _) = Call::get("/api/pots/10").send(&app).await;
     assert_eq!(status, StatusCode::OK);
@@ -871,4 +877,40 @@ async fn lists_challenges_that_have_not_ended(db: PgPool) {
     seed_challenge(&db, 14, "daily-100", "2 hours").await;
     let (_, again, _) = Call::get("/api/challenges").send(&app).await;
     assert_eq!(again, body);
+}
+
+#[sqlx::test]
+async fn opening_a_challenge_creates_it_once(db: PgPool) {
+    use alloy::sol_types::SolCall;
+
+    let oracle = Arc::new(FakeOracle::default());
+    let (state, rpc) = testing::state(db.clone(), oracle.clone());
+    let curator = state.config.oracle_signer.address();
+    let app = crate::api::app(state);
+    let daily = crate::challenges::template("daily-20").unwrap();
+    let start = daily.upcoming(Utc::now())[0];
+
+    let off_catalog =
+        json!({ "key": "daily-20", "start_time": start + chrono::TimeDelta::hours(5) });
+    let (status, _, _) = Call::post("/api/challenges/open", off_catalog.to_string())
+        .send(&app)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    rpc.push_success(&Bytes::from(
+        crate::chain::IPushPot::curatorCall::abi_encode_returns(&curator),
+    ));
+    rpc.push_success(&Bytes::from(
+        crate::chain::IPushPot::maxStakeCall::abi_encode_returns(&20_000_000u128),
+    ));
+    rpc.push_success(&"0x64");
+    let body = json!({ "key": "daily-20", "start_time": start }).to_string();
+    let (status, first, _) = Call::post("/api/challenges/open", body.clone())
+        .send(&app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, again, _) = Call::post("/api/challenges/open", body).send(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["pot_id"], again["pot_id"]);
+    assert_eq!(oracle.challenge_titles().len(), 1);
 }

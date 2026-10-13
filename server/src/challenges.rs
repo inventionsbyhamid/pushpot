@@ -1,7 +1,12 @@
-//! Official challenges: a fixed catalog of templates that the server opens on a schedule from the
-//! curator key (the oracle key in deployment), so there is always a cohort anyone can join.
+//! Official challenges: a fixed catalog of templates whose upcoming instances are always on offer.
+//! An instance only goes on chain, from the curator key (the oracle key in deployment), the first
+//! time someone wants to join it, so nobody pays gas for challenges nobody plays.
 
-use std::{iter::successors, sync::atomic::Ordering, time::Duration};
+use std::{
+    iter::successors,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
 use alloy::{
     primitives::{Address, B256},
@@ -24,9 +29,13 @@ use crate::{
     state::AppState,
 };
 
-const INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// How often to look for openings interrupted by a crash or an unconfirmed transaction. Such a
+/// row blocks its instance until then, and checking costs one query.
+const INTERVAL: Duration = Duration::from_secs(2 * 60);
 /// Too close to the start for anyone to find and join.
-const MIN_LEAD: TimeDelta = TimeDelta::hours(1);
+const MIN_LEAD: TimeDelta = TimeDelta::minutes(15);
+/// How long a request waits for an opening another request already started.
+const OPEN_WAIT: Duration = Duration::from_secs(20);
 /// Mirrors `PushPot.MAX_START_DELAY`.
 const MAX_LEAD: TimeDelta = TimeDelta::days(30);
 const USDC: u128 = 1_000_000;
@@ -44,7 +53,7 @@ pub enum Cadence {
 }
 
 impl Cadence {
-    /// How many upcoming instances to keep open.
+    /// How many upcoming instances are on offer at a time.
     fn ahead(self) -> usize {
         match self {
             Self::Daily | Self::Weekly | Self::Weekend => 2,
@@ -236,9 +245,9 @@ pub fn template(key: &str) -> Option<&'static Template> {
 }
 
 impl Template {
-    /// The starts that should already be open at `now`: the next few, if the contract accepts
-    /// them and there's time left for people to join.
-    fn upcoming(&self, now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+    /// The starts on offer at `now`: the next few, if the contract accepts them and there's time
+    /// left for people to join.
+    pub fn upcoming(&self, now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
         successors(Some(self.starts.next(now)), |&start| {
             Some(self.starts.next(start))
         })
@@ -267,7 +276,7 @@ impl Template {
         }
     }
 
-    fn params(&self, start: DateTime<Utc>) -> PotParams {
+    pub fn params(&self, start: DateTime<Utc>) -> PotParams {
         PotParams {
             title: self.title(start),
             stake: self.stake,
@@ -280,124 +289,160 @@ impl Template {
     }
 }
 
-/// How soon to try again when the indexer hasn't caught up yet or a pass failed.
-const RETRY: Duration = Duration::from_secs(15);
-
+/// Recovers openings left 'pending' by a crash or an unconfirmed transaction. Reads the chain only
+/// when one is stuck.
 pub async fn run(state: AppState) {
-    // `maxStake` is immutable, so it's read from the contract once.
-    let mut max_stake = None;
     loop {
-        let wait = match curate(&state, Utc::now(), &mut max_stake).await {
-            Ok(true) => INTERVAL,
-            Ok(false) => RETRY,
-            Err(err) => {
-                let error = redact_url(&format!("{err:#}"), &state.config.rpc_url);
-                tracing::warn!(%error, "opening challenges failed");
-                RETRY
-            }
-        };
-        tokio::time::sleep(wait).await;
+        if let Err(err) = recover(&state).await {
+            let error = redact_url(&format!("{err:#}"), &state.config.rpc_url);
+            tracing::warn!(%error, "recovering challenge openings failed");
+        }
+        tokio::time::sleep(INTERVAL).await;
     }
 }
 
-/// Returns false when it couldn't run yet and should be retried soon. Makes no RPC calls unless an
-/// instance is missing or stuck.
-async fn curate(
-    state: &AppState,
-    now: DateTime<Utc>,
-    max_stake: &mut Option<u128>,
-) -> Result<bool> {
-    // On a fresh or restored database the indexer must see existing challenges first, or they'd
-    // be opened a second time.
-    if !state.indexer_ready.load(Ordering::Relaxed) {
-        tracing::info!("waiting for the indexer to catch up before opening challenges");
-        return Ok(false);
-    }
-    if !has_work(state, now).await? {
-        return Ok(true);
-    }
-    let ours = state.config.oracle_signer.address();
-    let curator = state.chain.curator().await.context("reading curator")?;
-    if curator != ours {
-        tracing::warn!(%curator, oracle = %ours, "the oracle key isn't the curator; not opening challenges");
-        return Ok(true);
-    }
-    let max_stake = match *max_stake {
-        Some(cached) => cached,
-        None => *max_stake.insert(state.chain.max_stake().await.context("reading max stake")?),
-    };
-    let head = state
-        .chain
-        .provider
-        .get_block_number()
-        .await
-        .context("block number")?;
-
-    reconcile(state, ours, head).await?;
-    open_missing(state, now, max_stake, head).await?;
-    Ok(true)
-}
-
-/// Whether any upcoming instance is missing (after adopting ones already on chain) or a pending
-/// one needs reconciling. Database only.
-async fn has_work(state: &AppState, now: DateTime<Utc>) -> Result<bool> {
+async fn recover(state: &AppState) -> Result<()> {
     let stuck: bool = sqlx::query_scalar(
         "select exists(select 1 from challenges
          where state = 'pending' and created_at < now() - interval '2 minutes')",
     )
     .fetch_one(&state.db)
     .await?;
-    if stuck {
-        return Ok(true);
+    if !stuck {
+        return Ok(());
     }
-    for template in CATALOG {
-        for start in template.upcoming(now) {
-            if !adopt_existing(&state.db, template, start, &template.title(start)).await? {
-                return Ok(true);
+    let head = state
+        .chain
+        .provider
+        .get_block_number()
+        .await
+        .context("block number")?;
+    reconcile(state, state.config.oracle_signer.address(), head).await
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error("that challenge isn't on offer right now")]
+    NotOffered,
+    #[error("challenges are warming up, try again in a moment")]
+    NotReady,
+    #[error("official challenges are switched off")]
+    Disabled,
+    #[error("{0}")]
+    Unavailable(String),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Opens an instance on chain the first time someone wants to join it and returns its pot id.
+/// Repeated and concurrent calls get the same pot.
+pub async fn open(state: &AppState, key: &str, start: DateTime<Utc>) -> Result<u64, OpenError> {
+    if !state.config.curator_enabled {
+        return Err(OpenError::Disabled);
+    }
+    let template = template(key).ok_or(OpenError::NotOffered)?;
+    if !template.upcoming(Utc::now()).contains(&start) {
+        return Err(OpenError::NotOffered);
+    }
+    // On a fresh or restored database the indexer must see existing challenges first, or they'd
+    // be opened a second time.
+    if !state.indexer_ready.load(Ordering::Relaxed) {
+        return Err(OpenError::NotReady);
+    }
+
+    let deadline = Instant::now() + OPEN_WAIT;
+    loop {
+        match lookup(&state.db, template, start).await? {
+            Lookup::Created(pot_id) => return Ok(pot_id),
+            Lookup::Missing => {
+                if let Some(pot_id) = create(state, template, start).await? {
+                    return Ok(pot_id);
+                }
+            }
+            Lookup::Pending if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Lookup::Pending => {
+                return Err(OpenError::Unavailable(
+                    "the challenge is still opening, try again shortly".into(),
+                ));
             }
         }
     }
-    Ok(false)
 }
 
-/// Opens every upcoming instance that doesn't exist yet. `head` is a block no new transaction can
-/// land at or before, which is where `reconcile` starts looking.
-pub async fn open_missing(
-    state: &AppState,
-    now: DateTime<Utc>,
-    max_stake: u128,
-    head: u64,
-) -> Result<()> {
-    for template in CATALOG {
-        if template.stake > max_stake {
-            tracing::warn!(
-                template = template.key,
-                stake = template.stake,
-                max_stake,
-                "challenge stake is above the contract's limit; skipping it"
-            );
-            continue;
-        }
-        for start in template.upcoming(now) {
-            open(state, template, start, head).await?;
-        }
-    }
-    Ok(())
+enum Lookup {
+    Created(u64),
+    Pending,
+    Missing,
 }
 
-/// Opens one instance unless it's already open or underway. The row is claimed as 'pending'
+/// Where an instance stands. One already on chain, for example from before a database restore,
+/// is adopted rather than opened again.
+async fn lookup(db: &PgPool, template: &Template, start: DateTime<Utc>) -> Result<Lookup> {
+    sqlx::query(
+        "insert into challenges (template_key, start_time, title, from_block, state, pot_id, created_tx)
+         select $1, $2, $3, p.created_block, 'created', p.id, p.created_tx
+         from pots p where p.official and p.title = $3 and p.start_time = $2
+         order by p.id limit 1
+         on conflict (template_key, start_time) do nothing",
+    )
+    .bind(template.key)
+    .bind(start)
+    .bind(template.title(start))
+    .execute(db)
+    .await?;
+    let row: Option<(String, Option<i64>)> = sqlx::query_as(
+        "select state, pot_id from challenges where template_key = $1 and start_time = $2",
+    )
+    .bind(template.key)
+    .bind(start)
+    .fetch_optional(db)
+    .await?;
+    Ok(match row {
+        Some((state, Some(pot_id))) if state == "created" => Lookup::Created(pot_id as u64),
+        Some(_) => Lookup::Pending,
+        None => Lookup::Missing,
+    })
+}
+
+/// Sends `createChallenge` for an instance nobody has claimed yet. The row is claimed as 'pending'
 /// before anything is sent, so a crash or restart leaves a row for `reconcile` rather than a
-/// second pot.
-async fn open(
+/// second pot. Returns `None` if another request claimed it first.
+async fn create(
     state: &AppState,
     template: &Template,
     start: DateTime<Utc>,
-    head: u64,
-) -> Result<()> {
-    let params = template.params(start);
-    if adopt_existing(&state.db, template, start, &params.title).await? {
-        return Ok(());
+) -> Result<Option<u64>, OpenError> {
+    let rpc = |err: alloy::contract::Error| {
+        OpenError::Unavailable(redact_url(&err.to_string(), &state.config.rpc_url))
+    };
+    let ours = state.config.oracle_signer.address();
+    let curator = state.chain.curator().await.map_err(rpc)?;
+    if curator != ours {
+        tracing::warn!(%curator, oracle = %ours, "the oracle key isn't the curator; can't open challenges");
+        return Err(OpenError::Disabled);
     }
+    let max_stake = state.chain.max_stake().await.map_err(rpc)?;
+    if template.stake > max_stake {
+        tracing::warn!(
+            template = template.key,
+            stake = template.stake,
+            max_stake,
+            "challenge stake is above the contract's limit"
+        );
+        return Err(OpenError::NotOffered);
+    }
+    let head = state
+        .chain
+        .provider
+        .get_block_number()
+        .await
+        .map_err(|err| {
+            OpenError::Unavailable(redact_url(&err.to_string(), &state.config.rpc_url))
+        })?;
+
+    let params = template.params(start);
     let claimed = sqlx::query(
         "insert into challenges (template_key, start_time, title, from_block)
          values ($1, $2, $3, $4)
@@ -408,9 +453,10 @@ async fn open(
     .bind(&params.title)
     .bind(head as i64)
     .execute(&state.db)
-    .await?;
+    .await
+    .map_err(anyhow::Error::from)?;
     if claimed.rows_affected() == 0 {
-        return Ok(());
+        return Ok(None);
     }
 
     let title = params.title.clone();
@@ -424,18 +470,22 @@ async fn open(
                 created.tx_hash,
             )
             .await?;
+            Ok(Some(created.pot_id))
         }
-        // Nothing was created, so free the slot for the next pass.
+        // Nothing was created, so free the slot for the next attempt.
         Err(OracleError::Rejected(reason)) => {
             tracing::error!(template = template.key, %title, %reason, "challenge refused");
             release(&state.db, template.key, start).await?;
+            Err(OpenError::Unavailable(reason))
         }
         // It may still land; `reconcile` finds out once the dust has settled.
         Err(err) => {
             tracing::warn!(template = template.key, %title, error = %err, "challenge unconfirmed");
+            Err(OpenError::Unavailable(
+                "opening the challenge is taking longer than usual, try again in a minute".into(),
+            ))
         }
     }
-    Ok(())
 }
 
 /// Settles instances left 'pending' by a crash or an unconfirmed transaction: 'created' if the
@@ -518,39 +568,6 @@ async fn created_by(
     Ok(pots)
 }
 
-/// Records an instance that is already on chain, for example one opened before the database was
-/// restored, instead of opening it again.
-async fn adopt_existing(
-    db: &PgPool,
-    template: &Template,
-    start: DateTime<Utc>,
-    title: &str,
-) -> Result<bool> {
-    let adopted = sqlx::query(
-        "insert into challenges (template_key, start_time, title, from_block, state, pot_id, created_tx)
-         select $1, $2, $3, p.created_block, 'created', p.id, p.created_tx
-         from pots p where p.official and p.title = $3 and p.start_time = $2
-         order by p.id limit 1
-         on conflict (template_key, start_time) do nothing",
-    )
-    .bind(template.key)
-    .bind(start)
-    .bind(title)
-    .execute(db)
-    .await?;
-    if adopted.rows_affected() > 0 {
-        return Ok(true);
-    }
-    let known: bool = sqlx::query_scalar(
-        "select exists(select 1 from challenges where template_key = $1 and start_time = $2)",
-    )
-    .bind(template.key)
-    .bind(start)
-    .fetch_one(db)
-    .await?;
-    Ok(known)
-}
-
 async fn mark_created(
     db: &PgPool,
     key: &str,
@@ -628,12 +645,20 @@ mod tests {
 
     #[test]
     fn starts_leave_time_to_join_and_respect_the_start_limit() {
+        // Midnight is 30 minutes away, which still leaves time to join; 10 minutes doesn't.
         let late = at("2026-10-31T23:30:00Z");
         assert_eq!(
             template("daily-20").upcoming(late),
+            [at("2026-11-01T00:00:00Z"), at("2026-11-02T00:00:00Z")]
+        );
+        assert_eq!(
+            template("daily-20").upcoming(at("2026-10-31T23:50:00Z")),
             [at("2026-11-02T00:00:00Z")]
         );
-        assert!(template("thirty-day").upcoming(late).is_empty());
+        assert_eq!(
+            template("thirty-day").upcoming(late),
+            [at("2026-11-01T00:00:00Z")]
+        );
 
         // November 1st is just over 30 days away, then just under.
         let thirty_day = template("thirty-day");
@@ -700,10 +725,69 @@ mod tests {
         .unwrap()
     }
 
-    #[sqlx::test]
-    async fn adopts_challenges_already_on_chain(db: PgPool) {
+    /// Answers for `create`'s chain reads: the curator, the stake limit and the block number.
+    fn chain_reads(rpc: &alloy::transports::mock::Asserter, curator: Address, max_stake: u128) {
+        use alloy::sol_types::SolCall;
+        rpc.push_success(&alloy::primitives::Bytes::from(
+            IPushPot::curatorCall::abi_encode_returns(&curator),
+        ));
+        rpc.push_success(&alloy::primitives::Bytes::from(
+            IPushPot::maxStakeCall::abi_encode_returns(&max_stake),
+        ));
+        rpc.push_success(&"0x64");
+    }
+
+    fn first_daily() -> (&'static Template, DateTime<Utc>) {
         let daily = template("daily-20");
-        let start = daily.upcoming(now())[0];
+        (daily, daily.upcoming(Utc::now())[0])
+    }
+
+    #[sqlx::test]
+    async fn opens_once_and_reuses_the_pot(db: PgPool) {
+        let oracle = Arc::new(FakeOracle::default());
+        let (state, rpc) = testing::state(db.clone(), oracle.clone());
+        let (daily, start) = first_daily();
+        chain_reads(&rpc, state.config.oracle_signer.address(), 20 * USDC);
+
+        assert_eq!(
+            open(&state, daily.key, start).await.unwrap(),
+            FIRST_CHALLENGE_ID
+        );
+        // No responses are queued any more, so a second creation would fail.
+        assert_eq!(
+            open(&state, daily.key, start).await.unwrap(),
+            FIRST_CHALLENGE_ID
+        );
+        assert_eq!(oracle.challenge_titles(), [daily.title(start)]);
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn only_offers_upcoming_catalog_instances(db: PgPool) {
+        let oracle = Arc::new(FakeOracle::default());
+        let (state, _) = testing::state(db, oracle.clone());
+        let (daily, start) = first_daily();
+
+        assert!(matches!(
+            open(&state, "daily-7", start).await,
+            Err(OpenError::NotOffered)
+        ));
+        let off_schedule = start + TimeDelta::hours(3);
+        assert!(matches!(
+            open(&state, daily.key, off_schedule).await,
+            Err(OpenError::NotOffered)
+        ));
+        let far_ahead = start + TimeDelta::days(60);
+        assert!(matches!(
+            open(&state, daily.key, far_ahead).await,
+            Err(OpenError::NotOffered)
+        ));
+        assert!(oracle.challenge_titles().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn adopts_an_instance_already_on_chain(db: PgPool) {
+        let (daily, start) = first_daily();
         sqlx::query(
             "insert into pots (id, creator, title, stake, reps_per_period, periods, period_seconds,
                  start_time, max_members, created_tx, created_block, official)
@@ -715,116 +799,78 @@ mod tests {
         .await
         .unwrap();
         let oracle = Arc::new(FakeOracle::default());
-        let (state, _) = testing::state(db.clone(), oracle.clone());
+        let (state, rpc) = testing::state(db.clone(), oracle.clone());
 
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
-
-        assert_eq!(oracle.challenge_titles().len(), 13);
-        assert!(!oracle.challenge_titles().contains(&daily.title(start)));
-        let adopted: (String, Option<i64>) = sqlx::query_as(
-            "select state, pot_id from challenges where template_key = 'daily-20' and start_time = $1",
-        )
-        .bind(start)
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert_eq!(adopted, ("created".to_owned(), Some(77)));
-    }
-
-    #[sqlx::test]
-    async fn makes_no_rpc_calls_when_every_challenge_is_open(db: PgPool) {
-        let oracle = Arc::new(FakeOracle::default());
-        let (state, rpc) = testing::state(db, oracle.clone());
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
-        let opened = oracle.challenge_titles().len();
-
-        // No responses are queued, so any RPC call would fail the pass.
-        assert!(curate(&state, now(), &mut None).await.unwrap());
-        assert_eq!(oracle.challenge_titles().len(), opened);
+        assert_eq!(open(&state, daily.key, start).await.unwrap(), 77);
+        assert!(oracle.challenge_titles().is_empty());
         assert!(rpc.read_q().is_empty());
     }
 
     #[sqlx::test]
-    async fn waits_for_the_indexer_before_opening_anything(db: PgPool) {
+    async fn waits_for_the_indexer_before_opening(db: PgPool) {
+        let oracle = Arc::new(FakeOracle::default());
+        let (state, _) = testing::state(db, oracle.clone());
+        state.indexer_ready.store(false, Ordering::Relaxed);
+        let (daily, start) = first_daily();
+
+        assert!(matches!(
+            open(&state, daily.key, start).await,
+            Err(OpenError::NotReady)
+        ));
+        assert!(oracle.challenge_titles().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn refuses_stakes_above_the_contract_limit(db: PgPool) {
         let oracle = Arc::new(FakeOracle::default());
         let (state, rpc) = testing::state(db, oracle.clone());
-        state.indexer_ready.store(false, Ordering::Relaxed);
+        let (daily, start) = first_daily();
+        chain_reads(&rpc, state.config.oracle_signer.address(), daily.stake - 1);
 
-        assert!(!curate(&state, now(), &mut None).await.unwrap());
+        assert!(matches!(
+            open(&state, daily.key, start).await,
+            Err(OpenError::NotOffered)
+        ));
         assert!(oracle.challenge_titles().is_empty());
-        assert!(rpc.read_q().is_empty(), "no RPC calls while waiting");
     }
 
     #[sqlx::test]
-    async fn opens_every_upcoming_challenge_once(db: PgPool) {
-        let oracle = Arc::new(FakeOracle::default());
-        let (state, _) = testing::state(db.clone(), oracle.clone());
-
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
-
-        // 3 daily × 2, 2 weekly × 2, 1 weekend × 2, 1 monthly, 1 yearly.
-        let titles = oracle.challenge_titles();
-        assert_eq!(titles.len(), 14);
-        assert!(titles.contains(&"Daily 100 · Oct 15".to_owned()));
-        assert!(titles.contains(&"Weekend Warrior · Oct 24".to_owned()));
-        let rows = rows(&db).await;
-        assert_eq!(rows.len(), 14);
-        assert!(
-            rows.iter()
-                .all(|(_, state, pot)| state == "created" && pot.is_some())
-        );
-        assert!(
-            rows.iter()
-                .any(|(_, _, pot)| *pot == Some(FIRST_CHALLENGE_ID as i64))
-        );
-    }
-
-    #[sqlx::test]
-    async fn skips_stakes_above_the_contract_limit(db: PgPool) {
-        let oracle = Arc::new(FakeOracle::default());
-        let (state, _) = testing::state(db.clone(), oracle.clone());
-
-        open_missing(&state, now(), 4 * USDC, 100).await.unwrap();
-
-        let opened: Vec<String> = rows(&db).await.into_iter().map(|row| row.0).collect();
-        assert_eq!(opened.len(), 8);
-        for key in ["daily-100", "iron-week", "thirty-day", "club-52"] {
-            assert!(!opened.iter().any(|k| k == key), "{key}");
-        }
-    }
-
-    #[sqlx::test]
-    async fn an_unconfirmed_challenge_is_never_sent_twice(db: PgPool) {
-        let oracle = Arc::new(FakeOracle::default());
-        *oracle.challenge_outcome.lock().unwrap() = Outcome::Lost;
-        let (state, _) = testing::state(db.clone(), oracle.clone());
-
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
-
-        assert_eq!(oracle.challenge_titles().len(), 14);
-        assert!(
-            rows(&db)
-                .await
-                .iter()
-                .all(|(_, state, _)| state == "pending")
-        );
-    }
-
-    #[sqlx::test]
-    async fn a_refused_challenge_is_tried_again(db: PgPool) {
+    async fn a_refused_opening_can_be_retried(db: PgPool) {
         let oracle = Arc::new(FakeOracle::default());
         *oracle.challenge_outcome.lock().unwrap() = Outcome::Refused;
-        let (state, _) = testing::state(db.clone(), oracle.clone());
+        let (state, rpc) = testing::state(db.clone(), oracle.clone());
+        let (daily, start) = first_daily();
+        let curator = state.config.oracle_signer.address();
 
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
+        chain_reads(&rpc, curator, 20 * USDC);
+        assert!(matches!(
+            open(&state, daily.key, start).await,
+            Err(OpenError::Unavailable(_))
+        ));
         assert!(rows(&db).await.is_empty());
 
         *oracle.challenge_outcome.lock().unwrap() = Outcome::Confirmed;
-        open_missing(&state, now(), 20 * USDC, 100).await.unwrap();
-        assert_eq!(oracle.challenge_titles().len(), 28);
-        assert_eq!(rows(&db).await.len(), 14);
+        chain_reads(&rpc, curator, 20 * USDC);
+        assert!(open(&state, daily.key, start).await.is_ok());
+        assert_eq!(oracle.challenge_titles().len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn an_unconfirmed_opening_is_left_for_recovery(db: PgPool) {
+        let oracle = Arc::new(FakeOracle::default());
+        *oracle.challenge_outcome.lock().unwrap() = Outcome::Lost;
+        let (state, rpc) = testing::state(db.clone(), oracle.clone());
+        let (daily, start) = first_daily();
+        chain_reads(&rpc, state.config.oracle_signer.address(), 20 * USDC);
+
+        assert!(matches!(
+            open(&state, daily.key, start).await,
+            Err(OpenError::Unavailable(_))
+        ));
+        assert_eq!(
+            rows(&db).await,
+            [(daily.key.to_owned(), "pending".to_owned(), None)]
+        );
     }
 
     #[sqlx::test]

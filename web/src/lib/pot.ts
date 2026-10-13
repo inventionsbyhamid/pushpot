@@ -21,7 +21,10 @@ export interface PotClock {
 }
 
 /** Derives the pot's phase from its schedule so the UI rolls over without waiting for the API. */
-export function potClock(pot: Pot, now: number): PotClock {
+export function potClock(
+  pot: Pick<Pot, "start_time" | "period_seconds" | "periods">,
+  now: number,
+): PotClock {
   const startsAt = Date.parse(pot.start_time);
   const periodMs = pot.period_seconds * 1000;
   const endsAt = startsAt + pot.periods * periodMs;

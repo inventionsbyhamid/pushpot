@@ -45,9 +45,23 @@ export interface ChallengeTemplate {
   tagline: string;
 }
 
+/** A challenge's terms, known from the schedule before it exists on chain. */
+export interface ChallengePlan {
+  title: string;
+  stake: number;
+  reps_per_period: number;
+  periods: number;
+  period_seconds: number;
+  start_time: string;
+  end_time: string;
+  max_members: number;
+}
+
 export interface Challenge {
-  pot: Pot;
   template: ChallengeTemplate;
+  plan: ChallengePlan;
+  /** Null until someone opens the challenge by joining it. */
+  pot: Pot | null;
 }
 
 export interface StartedWorkout {

@@ -1,6 +1,6 @@
 import { useConnectModal } from "@rainbow-me/rainbowkit";
 import { useEffect, useState, type ReactNode } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { useAccount, useReadContract } from "wagmi";
 import { Button, ButtonLink } from "../../components/Button";
 import { Spinner } from "../../components/Spinner";
@@ -29,7 +29,10 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
   const auth = useAuth();
   const { address, isConnected } = useAccount();
   const { openConnectModal } = useConnectModal();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [sheet, setSheet] = useState<SheetId | null>(null);
+  // Arriving from a challenge card's Join, or tapping Join before connecting a wallet.
+  const [wantsJoin, setWantsJoin] = useState(() => searchParams.has("join"));
   const [wantsWorkout, setWantsWorkout] = useState(false);
   const [claimed, setClaimed] = useState<bigint | null>(null);
 
@@ -41,6 +44,26 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
     args: address ? [BigInt(pot.id), address] : undefined,
     query: { enabled: clock.phase === "ended" && !!me && !!address },
   });
+
+  useEffect(() => {
+    if (searchParams.has("join")) setSearchParams({}, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  const canJoin = clock.phase === "upcoming" && !me && pot.member_count < pot.max_members;
+  useEffect(() => {
+    if (!wantsJoin || !isConnected) return;
+    setWantsJoin(false);
+    if (canJoin) setSheet("join");
+  }, [wantsJoin, isConnected, canJoin]);
+
+  const join = () => {
+    if (isConnected) {
+      setSheet("join");
+      return;
+    }
+    setWantsJoin(true);
+    openConnectModal?.();
+  };
 
   const workoutPath = `/p/${pot.id}/workout`;
   useEffect(() => {
@@ -86,7 +109,7 @@ export function PotActionBar({ pot, clock, now, me, meState }: PotActionBarProps
       content = (
         <Button
           className="min-h-14 w-full text-2xl"
-          onClick={() => (isConnected ? setSheet("join") : openConnectModal?.())}
+          onClick={join}
         >
           Join for {formatUsdc(pot.stake)}
         </Button>

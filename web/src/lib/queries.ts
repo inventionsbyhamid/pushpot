@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./api";
 import type { Challenge, Pot, PotDetail } from "./types";
 
@@ -40,5 +40,20 @@ export function useChallenges() {
     queryKey: potKeys.challenges,
     queryFn: async () => (await api.get<{ challenges: Challenge[] }>("/api/challenges")).challenges,
     refetchInterval: 60_000,
+  });
+}
+
+/** Puts a scheduled challenge on chain, or finds it if someone already did, and returns its id. */
+export function useOpenChallenge() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ template, plan }: Pick<Challenge, "template" | "plan">) =>
+      (
+        await api.post<{ pot_id: number }>("/api/challenges/open", {
+          key: template.key,
+          start_time: plan.start_time,
+        })
+      ).pot_id,
+    onSuccess: () => client.invalidateQueries({ queryKey: potKeys.challenges }),
   });
 }
