@@ -127,20 +127,22 @@ everything the indexer needs.
 - It doesn't poll, because free endpoints are rate limited. A WebSocket subscription to the
   contract's logs (`ARC_WS_URL`, derived from `ARC_RPC_URL` by default) delivers each log as it
   lands, and the indexer applies it as delivered.
-- `eth_getLogs` only fills gaps: from the stored cursor at startup, 2 s after the subscription
-  (re)connects, so every block the read stops short of is one the subscription delivers, and
+- `eth_getLogs` only fills gaps: from the stored cursor once the subscription is up, 2 s after
+  it (re)connects, so every block the read stops short of is one the subscription delivers, and
   every 5 seconds while it is down (`INDEXER_INTERVAL_MS`).
-- While the subscription is up, the cursor moves every 5 minutes (`INDEXER_IDLE_MS`) to the
-  head seen 5 minutes earlier: by then every log up to it has been delivered. That costs one
-  `eth_blockNumber`, about 300 calls a day idle, and keeps a restart's catch up short.
-- Reads cover at most 9,999 blocks. Free plans allow fewer (Alchemy's: 10), so a refused range
-  is halved until it is accepted, and that width is kept. Rate limits (HTTP 429) back off and
-  retry within the provider's compute unit budget. Reads stay one
-  block behind the head: behind a load balancer, the node answering `eth_getLogs` may not have
-  the block another node reported as the head yet.
+- The subscription delivers logs in block order, so each delivered batch moves the cursor to
+  the block before its newest log. After 5 quiet minutes (`INDEXER_IDLE_MS`) one
+  `eth_blockNumber` notes the head, and 30 s later, on the same connection, the cursor moves
+  there: by then every log up to it has been delivered. Idle, that is under 300 calls a day,
+  and a restart rereads at most the last few minutes.
+- Reads cover at most 9,999 blocks. Free plans allow fewer (Alchemy's: 10). A refused range is
+  narrowed to the range the provider suggests, or else halved, until it is accepted, and that
+  width is kept. Rate limits (HTTP 429) back off and retry within the provider's compute unit
+  budget. Reads stay one block behind the head: behind a load balancer, the node answering
+  `eth_getLogs` may not have the block another node reported as the head yet.
 - Applying a log twice is harmless: every write is an upsert or a no op when repeated, and
-  repeats come in block order. Read batches move the `last_block` cursor in the same
-  transaction; delivered logs at or below it are skipped.
+  repeats come in block order. Every cursor move is committed in the same transaction as the
+  logs it covers; delivered logs at or below it are skipped.
 - A log that can never be stored (undecodable, or data Postgres rejects) is logged and skipped
   rather than retried forever, which would stall every join and check-in after it. Titles are
   stripped of control characters. RPC and connection errors retry the whole batch, and 15
@@ -465,7 +467,7 @@ Configuration is through environment variables:
 | `BIND_ADDR` | optional |
 | `WEB_DIR` | optional |
 | `INDEXER_INTERVAL_MS` | optional, default `5000`; poll interval while the subscription is down |
-| `INDEXER_IDLE_MS` | optional, default `300000`; how often the cursor moves while it's live |
+| `INDEXER_IDLE_MS` | optional, default `300000`; how long the subscription may stay quiet before the cursor moves to the head |
 | `CURATOR_ENABLED` | optional, default `true`; opens official challenges |
 | `FEE_COLLECTOR_ENABLED` | optional, default `true`; collects finished pots' fees |
 

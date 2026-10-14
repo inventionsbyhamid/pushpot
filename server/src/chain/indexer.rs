@@ -4,9 +4,10 @@
 //!
 //! To keep RPC use low it doesn't poll. A WebSocket subscription delivers our contract's logs as
 //! they land and they are applied as delivered. `eth_getLogs` only fills gaps: from the stored
-//! cursor at startup, whenever the subscription reconnects, and every few seconds while it is
-//! down. While it is up, the cursor moves to a head seen one idle interval earlier, at the cost of
-//! a single `eth_blockNumber`, so a restart only rereads the last few minutes.
+//! cursor once the subscription is up, whenever it reconnects, and every few seconds while it is
+//! down. Delivered logs move the cursor along with them, and when nothing is delivered for an
+//! idle interval a single `eth_blockNumber` lets it catch up with the head, so a restart only
+//! rereads a few minutes of blocks.
 
 use std::{
     sync::{
@@ -27,7 +28,7 @@ use anyhow::{Context, Result};
 use chrono::DateTime;
 use futures_util::StreamExt;
 use sqlx::{Connection, PgConnection, PgPool};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 use url::Url;
 
 use super::{Chain, IPushPot::IPushPotEvents, redact_url};
@@ -43,6 +44,9 @@ const BATCH_WINDOW: Duration = Duration::from_millis(200);
 /// After the subscription (re)connects, how long to wait before reading the gap: every block
 /// the read then stops short of was produced after the subscription started, so it is delivered.
 const SETTLE: Duration = Duration::from_secs(2);
+/// How long a head must have been seen on a live subscription before the cursor moves there.
+/// Logs arrive within a second or two of their block, so by then all of them have.
+const CONFIRM: Duration = Duration::from_secs(30);
 
 /// What the subscription hands the indexer.
 enum Feed {
@@ -55,10 +59,8 @@ enum Feed {
 enum Wake {
     Logs(Vec<Log>),
     Resync,
-    /// An interval passed with nothing delivered.
-    Idle,
-    /// There is no subscription; the interval has passed.
-    Polling,
+    /// The scheduled time came with nothing delivered.
+    Due,
 }
 
 pub async fn run(state: AppState) {
@@ -71,19 +73,23 @@ pub async fn run(state: AppState) {
     };
     let live = Arc::new(AtomicBool::new(false));
     let (feed_tx, mut feed) = mpsc::channel(256);
-    match state.config.ws_url.clone() {
+    // With a subscription on the way, the first read waits for it so the gap is read only once.
+    let mut reading = match state.config.ws_url.clone() {
         Some(url) => {
             tokio::spawn(watch(url, state.chain.contract, feed_tx, live.clone()));
+            false
         }
-        None => drop(feed_tx),
-    }
+        None => {
+            drop(feed_tx);
+            true
+        }
+    };
     tracing::info!(cursor, "indexer started");
 
-    let mut reading = true;
     let mut failures = 0u32;
-    // A head seen while the subscription was up. Once an idle interval has passed on the same
-    // connection, every log up to it has been delivered, so the cursor can move there unread.
-    let mut checkpoint: Option<u64> = None;
+    // A head seen on the current connection, for the cursor to move to once it is confirmed.
+    let mut seen: Option<u64> = None;
+    let mut due = Instant::now() + state.config.indexer_interval;
     loop {
         if reading {
             match read(&state, &mut cursor).await {
@@ -93,6 +99,8 @@ pub async fn run(state: AppState) {
                     }
                     failures = 0;
                     reading = false;
+                    seen = None;
+                    due = Instant::now() + pause(&state, &live);
                     state.indexer_ready.store(true, Ordering::Relaxed);
                 }
                 Err(err) => {
@@ -114,60 +122,84 @@ pub async fn run(state: AppState) {
             }
         }
 
-        let up = live.load(Ordering::Relaxed);
-        let interval = if up {
-            state.config.indexer_idle_interval
-        } else {
-            state.config.indexer_interval
-        };
-        match wait(&mut feed, interval).await {
-            Wake::Logs(logs) => {
-                if let Err(err) = apply_delivered(&state, cursor, &logs).await {
+        match wait(&mut feed, due).await {
+            Wake::Logs(logs) => match apply_delivered(&state, cursor, &logs).await {
+                Ok(Some(moved)) => {
+                    cursor = moved;
+                    // A cursor this fresh needs no checkpoint for a while.
+                    if seen.is_none_or(|head| head <= cursor) {
+                        seen = None;
+                        due = Instant::now() + pause(&state, &live);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
                     let error = format!("{err:#}");
                     tracing::warn!(%error, "applying delivered logs failed; reading them instead");
                     reading = true;
                 }
-            }
+            },
             Wake::Resync => {
-                checkpoint = None;
+                seen = None;
                 tokio::time::sleep(SETTLE).await;
                 reading = true;
             }
-            Wake::Idle if up => match state.chain.provider.get_block_number().await {
-                Ok(head) => {
-                    if let Some(seen) = checkpoint.filter(|&seen| seen > cursor) {
-                        match commit(&state, &[], Some(seen)).await {
-                            Ok(()) => cursor = seen,
-                            Err(err) => {
-                                tracing::warn!(error = %format!("{err:#}"), "saving the cursor failed")
-                            }
-                        }
-                    }
-                    checkpoint = Some(head);
-                }
-                Err(err) => {
-                    let error = redact_url(&err.to_string(), &state.config.rpc_url);
-                    tracing::warn!(%error, "reading the head failed");
-                }
-            },
-            Wake::Idle | Wake::Polling => {
-                checkpoint = None;
-                reading = true;
+            Wake::Due if live.load(Ordering::Relaxed) => {
+                due = Instant::now() + checkpoint(&state, &mut cursor, &mut seen).await;
             }
+            Wake::Due => reading = true,
         }
     }
 }
 
-/// Waits for delivered logs, a reconnect, or `interval` passing.
-async fn wait(feed: &mut mpsc::Receiver<Feed>, interval: Duration) -> Wake {
+/// How long to go without a read: the idle interval while the subscription is up, the poll
+/// interval while it is down.
+fn pause(state: &AppState, live: &AtomicBool) -> Duration {
+    if live.load(Ordering::Relaxed) {
+        state.config.indexer_idle_interval
+    } else {
+        state.config.indexer_interval
+    }
+}
+
+/// Moves the cursor to the head without reading, in two steps: one notes the head, and the next,
+/// `CONFIRM` later on the same connection, moves the cursor there. Returns the wait until the
+/// next step.
+async fn checkpoint(state: &AppState, cursor: &mut u64, seen: &mut Option<u64>) -> Duration {
+    let Some(head) = seen.take() else {
+        return match state.chain.provider.get_block_number().await {
+            Ok(head) => {
+                *seen = Some(head);
+                CONFIRM
+            }
+            Err(err) => {
+                let error = redact_url(&err.to_string(), &state.config.rpc_url);
+                tracing::warn!(%error, "reading the head failed");
+                state.config.indexer_idle_interval
+            }
+        };
+    };
+    if head > *cursor {
+        match commit(state, &[], Some(head)).await {
+            Ok(()) => *cursor = head,
+            Err(err) => tracing::warn!(error = %format!("{err:#}"), "saving the cursor failed"),
+        }
+    }
+    state.config.indexer_idle_interval
+}
+
+/// Waits for delivered logs, a reconnect, or `due`. Anything delivered is handled first, so a
+/// checkpoint never lands after a reconnect it should have waited for.
+async fn wait(feed: &mut mpsc::Receiver<Feed>, due: Instant) -> Wake {
     let first = tokio::select! {
+        biased;
         item = feed.recv() => item,
-        () = tokio::time::sleep(interval) => return Wake::Idle,
+        () = tokio::time::sleep_until(due) => return Wake::Due,
     };
     match first {
         None => {
-            tokio::time::sleep(interval).await;
-            Wake::Polling
+            tokio::time::sleep_until(due).await;
+            Wake::Due
         }
         Some(Feed::Resync) => Wake::Resync,
         Some(Feed::Log(log)) => {
@@ -185,18 +217,21 @@ async fn wait(feed: &mut mpsc::Receiver<Feed>, interval: Duration) -> Wake {
     }
 }
 
-/// Applies logs the subscription delivered. Those at or below the cursor were already read. The
-/// cursor stays put: it only moves past blocks known to be complete.
-async fn apply_delivered(state: &AppState, cursor: u64, logs: &[Log]) -> Result<()> {
+/// Applies logs the subscription delivered; those at or below the cursor were already read.
+/// The subscription hands logs over in block order, so the cursor moves to the block before the
+/// newest one, which may still have more on the way. Returns where the cursor moved, if it did.
+async fn apply_delivered(state: &AppState, cursor: u64, logs: &[Log]) -> Result<Option<u64>> {
     let fresh: Vec<Log> = logs
         .iter()
         .filter(|log| !log.removed && log.block_number.is_some_and(|block| block > cursor))
         .cloned()
         .collect();
-    if fresh.is_empty() {
-        return Ok(());
-    }
-    commit(state, &fresh, None).await
+    let Some(newest) = fresh.iter().filter_map(|log| log.block_number).max() else {
+        return Ok(None);
+    };
+    let to = Some(newest - 1).filter(|&to| to > cursor);
+    commit(state, &fresh, to).await?;
+    Ok(to)
 }
 
 /// Keeps a log subscription open, reconnecting with backoff, and forwards what it delivers.
@@ -212,12 +247,13 @@ async fn watch(url: Url, contract: Address, feed: mpsc::Sender<Feed>, live: Arc<
                 .await
             {
                 Ok(subscription) => {
-                    live.store(true, Ordering::Relaxed);
                     backoff = Duration::from_secs(1);
                     tracing::info!("listening for contract events");
+                    // Announced first, so no checkpoint runs on this connection before its read.
                     if feed.send(Feed::Resync).await.is_err() {
                         return;
                     }
+                    live.store(true, Ordering::Relaxed);
                     let mut logs = subscription.into_stream();
                     while let Some(log) = logs.next().await {
                         if log.address() != contract {
@@ -750,7 +786,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn delivered_logs_are_applied_without_moving_the_cursor(db: PgPool) {
+    async fn delivered_logs_move_the_cursor_to_the_block_before_theirs(db: PgPool) {
         let (state, rpc) = testing::state(db.clone(), Arc::default());
         let member = Address::repeat_byte(0xbb);
 
@@ -759,14 +795,14 @@ mod tests {
             at_block(created(1, "gm"), 12, 0),
             at_block(joined(1, member), 12, 1),
         ];
-        apply_delivered(&state, 5, &logs).await.unwrap();
+        assert_eq!(apply_delivered(&state, 5, &logs).await.unwrap(), Some(11));
 
         let members: i64 = sqlx::query_scalar("select count(*) from members where pot_id = 1")
             .fetch_one(&db)
             .await
             .unwrap();
         assert_eq!(members, 1);
-        assert_eq!(stored_cursor(&db).await, None);
+        assert_eq!(stored_cursor(&db).await, Some(11));
     }
 
     #[sqlx::test]
@@ -774,9 +810,10 @@ mod tests {
         let (state, rpc) = testing::state(db.clone(), Arc::default());
 
         // Pot creation would read its fee from the chain; skipping it means no call at all.
-        apply_delivered(&state, 12, &[at_block(created(1, "gm"), 12, 0)])
+        let moved = apply_delivered(&state, 12, &[at_block(created(1, "gm"), 12, 0)])
             .await
             .unwrap();
+        assert_eq!(moved, None);
         assert!(rpc.read_q().is_empty());
         let pots: i64 = sqlx::query_scalar("select count(*) from pots")
             .fetch_one(&db)
@@ -810,15 +847,54 @@ mod tests {
         assert_eq!(active, [false]);
     }
 
+    #[sqlx::test]
+    async fn the_cursor_moves_to_a_head_once_it_is_confirmed(db: PgPool) {
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        let (mut cursor, mut seen) = (5, None);
+
+        rpc.push_success(&"0x20");
+        assert_eq!(checkpoint(&state, &mut cursor, &mut seen).await, CONFIRM);
+        assert_eq!((cursor, seen), (5, Some(32)));
+        assert_eq!(stored_cursor(&db).await, None);
+
+        let idle = state.config.indexer_idle_interval;
+        assert_eq!(checkpoint(&state, &mut cursor, &mut seen).await, idle);
+        assert_eq!((cursor, seen), (32, None));
+        assert_eq!(stored_cursor(&db).await, Some(32));
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn a_head_the_cursor_already_passed_is_ignored(db: PgPool) {
+        let (state, _rpc) = testing::state(db.clone(), Arc::default());
+        let (mut cursor, mut seen) = (40, Some(32));
+
+        checkpoint(&state, &mut cursor, &mut seen).await;
+        assert_eq!((cursor, seen), (40, None));
+        assert_eq!(stored_cursor(&db).await, None);
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
     #[tokio::test]
     async fn a_reconnect_during_a_batch_reads_instead() {
         let (tx, mut feed) = mpsc::channel(8);
         tx.send(Feed::Log(Box::default())).await.unwrap();
         tx.send(Feed::Resync).await.unwrap();
+        assert!(matches!(wait(&mut feed, later()).await, Wake::Resync));
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_comes_before_a_checkpoint_that_is_due() {
+        let (tx, mut feed) = mpsc::channel(8);
+        tx.send(Feed::Resync).await.unwrap();
         assert!(matches!(
-            wait(&mut feed, Duration::from_secs(60)).await,
+            wait(&mut feed, Instant::now()).await,
             Wake::Resync
         ));
+        assert!(matches!(wait(&mut feed, Instant::now()).await, Wake::Due));
     }
 
     #[tokio::test]
@@ -827,7 +903,7 @@ mod tests {
         for _ in 0..3 {
             tx.send(Feed::Log(Box::default())).await.unwrap();
         }
-        let Wake::Logs(logs) = wait(&mut feed, Duration::from_secs(60)).await else {
+        let Wake::Logs(logs) = wait(&mut feed, later()).await else {
             panic!("expected logs");
         };
         assert_eq!(logs.len(), 3);

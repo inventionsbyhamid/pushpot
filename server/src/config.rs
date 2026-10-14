@@ -19,7 +19,7 @@ pub struct Config {
     pub web_dir: PathBuf,
     /// Poll interval while no event subscription is live.
     pub indexer_interval: Duration,
-    /// Safety poll while the subscription is live, to catch anything it missed.
+    /// How long the live subscription may go quiet before the cursor is moved up to the head.
     pub indexer_idle_interval: Duration,
     /// Opens the official challenges in the catalog. Off for test deployments.
     pub curator_enabled: bool,
