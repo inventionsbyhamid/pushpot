@@ -155,9 +155,10 @@ everything the indexer needs.
 
 - One task owns the oracle key, so nonces never race. It sends `checkIn`, `createChallenge` (in
   deployment the oracle key is also the curator) and `collectFee`.
-- Requests arrive over a channel. The task simulates each call, sends it with
-  `maxFeePerGas` ≥ 20 gwei (Arc's floor: anything lower is silently dropped), then polls for
-  the receipt and logs what it cost.
+- Requests arrive over a channel. The task sends each call with `maxFeePerGas` ≥ 20 gwei
+  (Arc's floor: anything lower is silently dropped), then polls for the receipt and logs what
+  it cost. Estimating gas runs the call, so a contract rejection comes back as a readable error
+  before anything is sent.
 - A request that waited more than 30 s in the queue fails without being sent, so a backlog
   clears quickly and the member can retry.
 - A check-in costs roughly $0.002 and confirms in about a second.

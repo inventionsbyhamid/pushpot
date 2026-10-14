@@ -322,16 +322,13 @@ impl Worker {
         })
     }
 
-    /// Simulates the call, sends it, and waits for a successful receipt.
+    /// Sends the call and waits for a successful receipt. Estimating gas runs the call, so a
+    /// contract rejection comes back as a readable error before anything is sent.
     async fn send<C: SolCall + Send + Sync>(
         &self,
         call: SolCallBuilder<&DynProvider, C>,
     ) -> Result<TransactionReceipt, OracleError> {
         let sent = async {
-            // Simulate first so contract rejections come back as readable errors instead of a
-            // mined revert.
-            call.call().await.map_err(classify)?;
-
             let gas_price = self.gas_price().await?;
             let pending = call
                 .max_fee_per_gas((gas_price * 2).max(MIN_MAX_FEE))
@@ -413,8 +410,8 @@ mod tests {
     use alloy::{
         primitives::{LogData, U256},
         providers::ProviderBuilder,
-        sol_types::SolEvent,
-        transports::mock::Asserter,
+        sol_types::{SolEvent, SolInterface},
+        transports::{RpcError, mock::Asserter},
     };
     use serde_json::json;
 
@@ -529,5 +526,21 @@ mod tests {
         assert_eq!(created.potId, U256::from(42));
         assert!(event::<IPushPot::FeeCollected>(&receipt, contract).is_none());
         assert!((cost_usdc(&receipt) - 0.004).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_refused_gas_estimate_reads_as_the_contract_error() {
+        let revert = IPushPotErrors::PotNotFound(IPushPot::PotNotFound {}).abi_encode();
+        let payload = serde_json::from_value(json!({
+            "code": 3,
+            "message": "execution reverted",
+            "data": alloy::primitives::Bytes::from(revert),
+        }))
+        .unwrap();
+        let err = ContractError::TransportError(RpcError::ErrorResp(payload));
+        assert!(matches!(
+            classify(err),
+            OracleError::Rejected(reason) if reason == "pot not found"
+        ));
     }
 }
