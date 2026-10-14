@@ -2,16 +2,17 @@ import {
   isAddressEqual,
   parseEventLogs,
   parseSignature,
+  WaitForTransactionReceiptTimeoutError,
   type Address,
   type Hash,
   type TransactionReceipt,
 } from "viem";
 import {
   getAccount,
+  getTransactionReceipt,
   readContract,
   signTypedData,
   simulateContract,
-  waitForTransactionReceipt,
   writeContract,
 } from "wagmi/actions";
 import { pushPotAbi } from "./abi";
@@ -22,6 +23,8 @@ import { wagmiConfig } from "./wagmi";
 
 const PERMIT_TTL_SECONDS = 60 * 60;
 const RECEIPT_TIMEOUT_MS = 90_000;
+/** Arc confirms in about a second, so asking for the receipt beats watching blocks for it. */
+const RECEIPT_POLL_MS = 500;
 
 export type TxStep = "sign" | "send" | "confirm";
 export type ReportStep = (step: TxStep, hash?: Hash) => void;
@@ -95,8 +98,7 @@ export interface JoinTerms {
   feeBps: number;
 }
 
-async function ensureFunds(owner: Address, stake: bigint): Promise<void> {
-  const balance = await readUsdcBalance(owner);
+function ensureFunds(balance: bigint, stake: bigint): void {
   const needed = stake + GAS_HEADROOM;
   if (balance < needed) throw new InsufficientUsdcError(needed, balance);
 }
@@ -135,13 +137,21 @@ async function confirm(
 ): Promise<{ receipt: TransactionReceipt; confirmMs: number }> {
   report("confirm", hash);
   const sentAt = performance.now();
-  const receipt = await waitForTransactionReceipt(wagmiConfig, {
-    chainId: chain.id,
-    hash,
-    timeout: RECEIPT_TIMEOUT_MS,
-  });
+  const receipt = await pollReceipt(hash, sentAt + RECEIPT_TIMEOUT_MS);
   if (receipt.status !== "success") throw new TxRevertedError(hash);
   return { receipt, confirmMs: performance.now() - sentAt };
+}
+
+async function pollReceipt(hash: Hash, deadline: number): Promise<TransactionReceipt> {
+  while (performance.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, RECEIPT_POLL_MS));
+    try {
+      return await getTransactionReceipt(wagmiConfig, { chainId: chain.id, hash });
+    } catch {
+      // Not mined yet, or no RPC answered this time; the next poll may find it.
+    }
+  }
+  throw new WaitForTransactionReceiptTimeoutError({ hash });
 }
 
 function potLogs(receipt: TransactionReceipt) {
@@ -179,12 +189,18 @@ export async function createPot(
   report: ReportStep,
 ): Promise<TxOutcome & { potId: bigint }> {
   const owner = connectedOnArc();
+  // Read together, these go out as one multicall.
+  const [oracle, currentFeeBps, balance] = await Promise.all([
+    readOracle(),
+    readFeeBps(),
+    readUsdcBalance(owner),
+  ]);
   // A new pot is bound to whichever oracle the contract names right now.
-  if (!isAddressEqual(await readOracle(), trustedOracle)) throw new UntrustedOracleError();
-  if ((await readFeeBps()) !== feeBps) {
+  if (!isAddressEqual(oracle, trustedOracle)) throw new UntrustedOracleError();
+  if (currentFeeBps !== feeBps) {
     throw new Error("PushPot's fee changed since you loaded this page. Reload and review it.");
   }
-  await ensureFunds(owner, params.stake);
+  ensureFunds(balance, params.stake);
 
   report("sign");
   const permit = await signPermit(owner, params.stake);
@@ -219,7 +235,7 @@ export async function joinPot(
   report: ReportStep,
 ): Promise<TxOutcome> {
   const owner = connectedOnArc();
-  const pot = await readPot(potId);
+  const [pot, balance] = await Promise.all([readPot(potId), readUsdcBalance(owner)]);
   if (!isAddressEqual(pot.oracle, trustedOracle)) throw new UntrustedOracleError();
   const matches =
     pot.stake === terms.stake &&
@@ -234,7 +250,7 @@ export async function joinPot(
     );
   }
   const stake = pot.stake;
-  await ensureFunds(owner, stake);
+  ensureFunds(balance, stake);
 
   report("sign");
   const permit = await signPermit(owner, stake);
