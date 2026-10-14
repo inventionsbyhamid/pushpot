@@ -165,8 +165,9 @@ impl Chain {
     }
 
     /// Reads logs matching `filter` from `from` towards `to` and returns them with the last block
-    /// they cover. A provider that refuses the range as too wide is asked for half as many blocks
-    /// until it accepts, and the width that worked is kept for later queries.
+    /// they cover. A provider that refuses the range as too wide is asked for the range it
+    /// suggests, or else half as many blocks, until it accepts, and the width that worked is kept
+    /// for later queries.
     pub async fn logs(&self, filter: &Filter, from: u64, to: u64) -> Result<(Vec<Log>, u64)> {
         let mut to = to.min(from + self.log_range.load(Ordering::Relaxed) - 1);
         loop {
@@ -174,8 +175,9 @@ impl Chain {
             match self.provider.get_logs(&query).await {
                 Ok(logs) => return Ok((logs, to)),
                 Err(err) if to > from && err.to_string().to_ascii_lowercase().contains("range") => {
-                    // Halving ends within a factor of two of the limit wherever it starts.
-                    let narrower = (to - from).div_ceil(2);
+                    let narrower = suggested_range(&err.to_string())
+                        .filter(|&blocks| blocks <= to - from)
+                        .unwrap_or_else(|| (to - from + 1).div_ceil(2));
                     self.log_range.store(narrower, Ordering::Relaxed);
                     tracing::warn!(
                         blocks = narrower,
@@ -266,6 +268,17 @@ fn is_erc1271_magic(output: &[u8]) -> bool {
     output.len() == 32 && output[..4] == ERC1271_MAGIC && output[4..].iter().all(|&b| b == 0)
 }
 
+/// The width of the block range a provider names when refusing a wider one, as in Alchemy's
+/// "this block range should work: [0x1891854, 0x189185d]".
+fn suggested_range(message: &str) -> Option<u64> {
+    let (_, rest) = message.split_once("[0x")?;
+    let (range, _) = rest.split_once(']')?;
+    let (start, end) = range.split_once(',')?;
+    let start = u64::from_str_radix(start.trim(), 16).ok()?;
+    let end = u64::from_str_radix(end.trim().strip_prefix("0x")?, 16).ok()?;
+    end.checked_sub(start).map(|blocks| blocks + 1)
+}
+
 /// Strips the parts of the RPC URL that may hold an API key from text bound for logs. Transport
 /// errors quote the full request URL.
 pub fn redact_url(text: &str, url: &Url) -> String {
@@ -309,6 +322,17 @@ mod tests {
         let mut echoed = word(&ERC1271_MAGIC).to_vec();
         echoed.extend_from_slice(&[0u8; 64]);
         assert!(!is_erc1271_magic(&echoed));
+    }
+
+    #[test]
+    fn reads_the_range_a_provider_suggests() {
+        let alchemy = "server returned an error response: error code -32600: Under the Free tier \
+                       plan, you can make eth_getLogs requests with up to a 10 block range. Based \
+                       on your parameters, this block range should work: [0x1891854, 0x189185d]. \
+                       Upgrade to PAYG for expanded block range.";
+        assert_eq!(suggested_range(alchemy), Some(10));
+        assert_eq!(suggested_range("block range too large"), None);
+        assert_eq!(suggested_range("try [0x10, 0x5]"), None);
     }
 
     #[tokio::test]

@@ -703,10 +703,28 @@ mod tests {
     #[sqlx::test]
     async fn narrows_log_queries_the_provider_refuses(db: PgPool) {
         let (state, rpc) = testing::state(db.clone(), Arc::default());
-        let refusal = "Under the Free tier plan, you can make eth_getLogs requests with up to a \
-                       10 block range.";
 
-        // Head 31: blocks 6 to 30 are refused, then read as 6 to 17, 18 to 29 and 30.
+        // Head 31: blocks 6 to 30 are refused, then read as 6 to 18 and 19 to 30.
+        rpc.push_success(&"0x1f");
+        rpc.push_failure_msg("block range is too wide");
+        for _ in 0..2 {
+            rpc.push_success(&Vec::<Log>::new());
+        }
+        let mut cursor = 5;
+        read(&state, &mut cursor).await.unwrap();
+        assert_eq!(cursor, 30);
+        assert_eq!(state.chain.log_range.load(Ordering::Relaxed), 13);
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn takes_the_range_the_provider_suggests(db: PgPool) {
+        let (state, rpc) = testing::state(db.clone(), Arc::default());
+        let refusal = "Under the Free tier plan, you can make eth_getLogs requests with up to a \
+                       10 block range. Based on your parameters, this block range should work: \
+                       [0x6, 0xf].";
+
+        // Head 31: blocks 6 to 30 are refused, then read as 6 to 15, 16 to 25 and 26 to 30.
         rpc.push_success(&"0x1f");
         rpc.push_failure_msg(refusal);
         for _ in 0..3 {
@@ -715,7 +733,7 @@ mod tests {
         let mut cursor = 5;
         read(&state, &mut cursor).await.unwrap();
         assert_eq!(cursor, 30);
-        assert_eq!(state.chain.log_range.load(Ordering::Relaxed), 12);
+        assert_eq!(state.chain.log_range.load(Ordering::Relaxed), 10);
         assert!(rpc.read_q().is_empty());
     }
 
